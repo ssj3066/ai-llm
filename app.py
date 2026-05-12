@@ -12,15 +12,21 @@ import csv
 import io
 import json
 import os
+import base64
+import html
+import shutil
 import socket
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -56,7 +62,7 @@ API_TOKEN = os.getenv("LLM_OPS_TOKEN", "")
 DEFAULT_MODEL = os.getenv("LLM_OPS_DEFAULT_MODEL", "metro-report:latest")
 FAST_MODEL = os.getenv("LLM_OPS_FAST_MODEL", "metro-fast:latest")
 REQUEST_TIMEOUT = int(os.getenv("LLM_OPS_REQUEST_TIMEOUT_SECONDS", "600"))
-MAX_BODY_BYTES = int(os.getenv("LLM_OPS_MAX_BODY_BYTES", str(4 * 1024 * 1024)))
+MAX_BODY_BYTES = int(os.getenv("LLM_OPS_MAX_BODY_BYTES", str(16 * 1024 * 1024)))
 KEEP_ALIVE = os.getenv("LLM_OPS_KEEP_ALIVE", "30m")
 ALLOWED_ORIGIN = os.getenv("LLM_OPS_ALLOWED_ORIGIN", "*")
 NMS_CONTEXT_BASE_URL = os.getenv("NMS_CONTEXT_BASE_URL", "http://192.168.1.33:7443").rstrip("/")
@@ -90,6 +96,17 @@ CONVERSATION_DB_PATH = Path(os.getenv("LLM_OPS_CONVERSATION_DB", str(APP_DIR / "
 CONVERSATION_HISTORY_LIMIT = int(os.getenv("LLM_OPS_CONVERSATION_HISTORY_LIMIT", "18"))
 CONVERSATION_MESSAGE_CHAR_LIMIT = int(os.getenv("LLM_OPS_CONVERSATION_MESSAGE_CHAR_LIMIT", "16000"))
 CONVERSATION_TITLE_CHAR_LIMIT = int(os.getenv("LLM_OPS_CONVERSATION_TITLE_CHAR_LIMIT", "80"))
+SAVED_ANALYSIS_CONTEXT_LIMIT = int(os.getenv("LLM_OPS_SAVED_ANALYSIS_CONTEXT_LIMIT", "4"))
+SAVED_ANALYSIS_CONTENT_CHAR_LIMIT = int(os.getenv("LLM_OPS_SAVED_ANALYSIS_CONTENT_CHAR_LIMIT", "24000"))
+SAVED_ANALYSIS_SOURCE_CHAR_LIMIT = int(os.getenv("LLM_OPS_SAVED_ANALYSIS_SOURCE_CHAR_LIMIT", "10000"))
+SAVED_ANALYSIS_PREVIEW_CHAR_LIMIT = int(os.getenv("LLM_OPS_SAVED_ANALYSIS_PREVIEW_CHAR_LIMIT", "180"))
+ATTACHMENT_MAX_COUNT = int(os.getenv("LLM_OPS_ATTACHMENT_MAX_COUNT", "5"))
+ATTACHMENT_MAX_FILE_BYTES = int(os.getenv("LLM_OPS_ATTACHMENT_MAX_FILE_BYTES", str(5 * 1024 * 1024)))
+ATTACHMENT_MAX_TOTAL_BYTES = int(os.getenv("LLM_OPS_ATTACHMENT_MAX_TOTAL_BYTES", str(12 * 1024 * 1024)))
+ATTACHMENT_TEXT_CHAR_LIMIT = int(os.getenv("LLM_OPS_ATTACHMENT_TEXT_CHAR_LIMIT", "8000"))
+ATTACHMENT_TOTAL_TEXT_CHAR_LIMIT = int(os.getenv("LLM_OPS_ATTACHMENT_TOTAL_TEXT_CHAR_LIMIT", "28000"))
+ATTACHMENT_CSV_ROW_LIMIT = int(os.getenv("LLM_OPS_ATTACHMENT_CSV_ROW_LIMIT", "120"))
+ATTACHMENT_TABLE_COLUMN_LIMIT = int(os.getenv("LLM_OPS_ATTACHMENT_TABLE_COLUMN_LIMIT", "20"))
 OPENAI_COMPAT_OBJECT = "chat.completion"
 
 
@@ -105,6 +122,245 @@ def clip_text(value: Any, limit: int = CONVERSATION_MESSAGE_CHAR_LIMIT) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit].rstrip()}\n\n...[truncated {len(text) - limit} chars]"
+
+
+def sanitize_attachment_name(value: Any) -> str:
+    name = Path(str(value or "attachment").strip() or "attachment").name
+    return clip_text(name.replace("\x00", ""), 180)
+
+
+def attachment_extension(name: str) -> str:
+    return Path(name).suffix.lower()
+
+
+def decode_text_bytes(raw: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+        try:
+            return raw.decode(encoding)
+        except Exception:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def extract_csv_text(raw: bytes) -> str:
+    text = decode_text_bytes(raw)
+    reader = csv.reader(io.StringIO(text))
+    rows: list[str] = []
+    for index, row in enumerate(reader):
+        if index >= ATTACHMENT_CSV_ROW_LIMIT:
+            rows.append(f"...[rows truncated after {ATTACHMENT_CSV_ROW_LIMIT}]")
+            break
+        normalized = [cell.strip() for cell in row[:ATTACHMENT_TABLE_COLUMN_LIMIT]]
+        rows.append(" | ".join(normalized))
+    return "\n".join(rows) if rows else text
+
+
+def xml_text(node: ET.Element) -> str:
+    return "".join(part for part in node.itertext() if part)
+
+
+def extract_docx_text(raw: bytes) -> str:
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        xml_bytes = archive.read("word/document.xml")
+    root = ET.fromstring(xml_bytes)
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    lines: list[str] = []
+    for paragraph in root.findall(".//w:p", ns):
+        paragraph_text = "".join(
+            text for text in (node.text or "" for node in paragraph.findall(".//w:t", ns)) if text
+        ).strip()
+        if paragraph_text:
+            lines.append(html.unescape(paragraph_text))
+    return "\n".join(lines)
+
+
+def extract_xlsx_text(raw: bytes) -> str:
+    ns = {
+        "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "rel": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "pkg": "http://schemas.openxmlformats.org/package/2006/relationships",
+    }
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        shared_strings: list[str] = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            shared_root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            for item in shared_root.findall(".//main:si", ns):
+                shared_strings.append("".join(text for text in item.itertext() if text))
+
+        workbook_root = ET.fromstring(archive.read("xl/workbook.xml"))
+        rel_root = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        rel_map = {
+            rel.attrib.get("Id"): rel.attrib.get("Target", "")
+            for rel in rel_root.findall(".//pkg:Relationship", ns)
+        }
+
+        blocks: list[str] = []
+        for sheet_index, sheet in enumerate(workbook_root.findall(".//main:sheets/main:sheet", ns), start=1):
+            if sheet_index > 4:
+                blocks.append("...[sheets truncated]")
+                break
+            rel_id = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+            target = rel_map.get(rel_id, "")
+            if not target:
+                continue
+            sheet_path = f"xl/{target}" if not target.startswith("xl/") else target
+            sheet_root = ET.fromstring(archive.read(sheet_path))
+            sheet_name = sheet.attrib.get("name") or f"Sheet{sheet_index}"
+            rows: list[str] = [f"시트: {sheet_name}"]
+            for row_index, row in enumerate(sheet_root.findall(".//main:sheetData/main:row", ns), start=1):
+                if row_index > ATTACHMENT_CSV_ROW_LIMIT:
+                    rows.append(f"...[rows truncated after {ATTACHMENT_CSV_ROW_LIMIT}]")
+                    break
+                values: list[str] = []
+                for cell_index, cell in enumerate(row.findall("main:c", ns), start=1):
+                    if cell_index > ATTACHMENT_TABLE_COLUMN_LIMIT:
+                        values.append("...[cols truncated]")
+                        break
+                    cell_type = cell.attrib.get("t") or ""
+                    value = ""
+                    if cell_type == "inlineStr":
+                        value = "".join(text for text in cell.itertext() if text)
+                    else:
+                        raw_value = cell.findtext("main:v", default="", namespaces=ns)
+                        if cell_type == "s" and raw_value.isdigit():
+                            index = int(raw_value)
+                            value = shared_strings[index] if index < len(shared_strings) else raw_value
+                        else:
+                            value = raw_value
+                    value = value.strip()
+                    if value or values:
+                        values.append(value)
+                if any(item.strip() for item in values):
+                    rows.append(" | ".join(values))
+            blocks.append("\n".join(rows))
+        return "\n\n".join(blocks)
+
+
+def fallback_strings_text(raw: bytes, suffix: str) -> str:
+    strings_cmd = shutil.which("strings")
+    if not strings_cmd:
+        raise RuntimeError("strings command not found")
+    with tempfile.TemporaryDirectory(prefix="llmops-strings-") as tempdir:
+        source_path = Path(tempdir) / f"attachment{suffix or '.bin'}"
+        source_path.write_bytes(raw)
+        proc = subprocess.run(
+            [strings_cmd, "-n", "4", str(source_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or "strings extraction failed")
+        return proc.stdout.strip()
+
+
+def libreoffice_text(raw: bytes, suffix: str) -> str:
+    libreoffice_cmd = shutil.which("libreoffice") or shutil.which("soffice")
+    if not libreoffice_cmd:
+        raise RuntimeError("libreoffice not installed")
+    with tempfile.TemporaryDirectory(prefix="llmops-lo-") as tempdir:
+        temp_path = Path(tempdir)
+        source_path = temp_path / f"attachment{suffix or '.bin'}"
+        source_path.write_bytes(raw)
+        proc = subprocess.run(
+            [
+                libreoffice_cmd,
+                "--headless",
+                "--convert-to",
+                "txt:Text",
+                "--outdir",
+                str(temp_path),
+                str(source_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        text_path = source_path.with_suffix(".txt")
+        if not text_path.exists():
+            raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "libreoffice conversion failed")
+        return text_path.read_text(encoding="utf-8", errors="replace")
+
+
+def extract_attachment_text(name: str, raw: bytes) -> tuple[str, str]:
+    suffix = attachment_extension(name)
+    if suffix in {".txt", ".log", ".md", ".json"}:
+        return decode_text_bytes(raw), "text"
+    if suffix in {".csv", ".tsv"}:
+        return extract_csv_text(raw), "csv"
+    if suffix == ".docx":
+        return extract_docx_text(raw), "docx"
+    if suffix == ".xlsx":
+        return extract_xlsx_text(raw), "xlsx"
+    if suffix in {".doc", ".xls"}:
+        try:
+            return libreoffice_text(raw, suffix), "libreoffice"
+        except Exception:
+            return fallback_strings_text(raw, suffix), "strings"
+    raise ValueError(f"unsupported attachment type: {suffix or 'unknown'}")
+
+
+def extract_attachments_context(attachments: Any) -> dict[str, Any]:
+    if not attachments:
+        return {"text": "", "items": [], "errors": [], "total_bytes": 0}
+    if not isinstance(attachments, list):
+        raise ValueError("attachments must be a list")
+    if len(attachments) > ATTACHMENT_MAX_COUNT:
+        raise ValueError(f"too many attachments: max {ATTACHMENT_MAX_COUNT}")
+
+    total_bytes = 0
+    items: list[dict[str, Any]] = []
+    errors: list[str] = []
+    blocks: list[str] = []
+    for index, attachment in enumerate(attachments, start=1):
+        if not isinstance(attachment, dict):
+            errors.append(f"attachment #{index}: invalid payload")
+            continue
+        name = sanitize_attachment_name(attachment.get("name") or f"attachment-{index}")
+        encoded = str(attachment.get("content_base64") or "").strip()
+        if not encoded:
+            errors.append(f"{name}: empty content")
+            continue
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except Exception:
+            errors.append(f"{name}: invalid base64")
+            continue
+        size = len(raw)
+        total_bytes += size
+        if size > ATTACHMENT_MAX_FILE_BYTES:
+            errors.append(f"{name}: file too large ({size} bytes)")
+            continue
+        if total_bytes > ATTACHMENT_MAX_TOTAL_BYTES:
+            errors.append(f"{name}: total attachment size exceeded")
+            continue
+        try:
+            text, method = extract_attachment_text(name, raw)
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+            continue
+        clipped = clip_text(text.strip(), ATTACHMENT_TEXT_CHAR_LIMIT)
+        if not clipped:
+            errors.append(f"{name}: extracted text is empty")
+            continue
+        item = {
+            "name": name,
+            "size": size,
+            "type": str(attachment.get("type") or ""),
+            "method": method,
+            "preview": clip_text(clipped, 240),
+        }
+        items.append(item)
+        blocks.append(
+            f"[첨부 {index}] {name} / size={size} bytes / method={method}\n{clipped}"
+        )
+    combined = ""
+    if blocks:
+        combined = "첨부자료 추출본\n\n" + "\n\n".join(blocks)
+        combined = clip_text(combined, ATTACHMENT_TOTAL_TEXT_CHAR_LIMIT)
+    return {"text": combined, "items": items, "errors": errors, "total_bytes": total_bytes}
 
 
 def init_conversation_store() -> None:
@@ -144,6 +400,36 @@ def init_conversation_store() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_conversations_updated_at
             ON conversations(updated_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS saved_analyses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                customer_name TEXT NOT NULL DEFAULT '',
+                site_code TEXT NOT NULL DEFAULT '',
+                site_name TEXT NOT NULL DEFAULT '',
+                analysis_kind TEXT NOT NULL DEFAULT 'freeform',
+                title TEXT NOT NULL DEFAULT '',
+                question TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL,
+                source_excerpt TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                meta_json TEXT NOT NULL DEFAULT '{}'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_saved_analyses_scope_updated
+            ON saved_analyses(customer_name, site_code, updated_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_saved_analyses_kind_updated
+            ON saved_analyses(analysis_kind, updated_at DESC)
             """
         )
         conn.commit()
@@ -353,6 +639,191 @@ def delete_conversation(conversation_id: str) -> bool:
         return result.rowcount > 0
 
 
+def normalize_site_codes(value: Any) -> list[str]:
+    if isinstance(value, list):
+        parts = value
+    else:
+        parts = str(value or "").split(",")
+    seen: set[str] = set()
+    codes: list[str] = []
+    for part in parts:
+        code = str(part or "").strip()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        codes.append(code[:80])
+    return codes
+
+
+def normalize_saved_analysis_id(value: Any) -> int | None:
+    try:
+        parsed = int(str(value or "").strip())
+        return parsed if parsed > 0 else None
+    except Exception:
+        return None
+
+
+def serialize_saved_analysis_row(row: sqlite3.Row, include_content: bool = False) -> dict[str, Any]:
+    try:
+        meta = json.loads(row["meta_json"] or "{}")
+    except Exception:
+        meta = {}
+    content = row["content"] or ""
+    item = {
+        "id": int(row["id"]),
+        "customer_name": row["customer_name"] or "",
+        "site_code": row["site_code"] or "",
+        "site_name": row["site_name"] or "",
+        "analysis_kind": row["analysis_kind"] or "freeform",
+        "title": row["title"] or "",
+        "question": row["question"] or "",
+        "source_excerpt": row["source_excerpt"] or "",
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "meta": meta,
+        "content_preview": clip_text(content, SAVED_ANALYSIS_PREVIEW_CHAR_LIMIT),
+    }
+    if include_content:
+        item["content"] = content
+    return item
+
+
+def list_saved_analyses(
+    customer_name: str = "",
+    site_code: Any = "",
+    limit: int = 50,
+    include_content: bool = False,
+) -> list[dict[str, Any]]:
+    init_conversation_store()
+    safe_limit = max(1, min(int(limit or 50), 200))
+    normalized_customer = clip_text(str(customer_name or "").strip(), 200)
+    site_codes = normalize_site_codes(site_code)
+    conditions: list[str] = []
+    params: list[Any] = []
+    placeholders = ""
+    if normalized_customer:
+        conditions.append("customer_name = ?")
+        params.append(normalized_customer)
+    if site_codes:
+        placeholders = ",".join("?" for _ in site_codes)
+        conditions.append(f"(site_code = '' OR site_code IN ({placeholders}))")
+        params.extend(site_codes)
+    query = "SELECT * FROM saved_analyses"
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    if site_codes:
+        query += f" ORDER BY CASE WHEN site_code IN ({placeholders}) THEN 0 WHEN site_code = '' THEN 1 ELSE 2 END, updated_at DESC"
+        params.extend(site_codes)
+    else:
+        query += " ORDER BY updated_at DESC"
+    query += " LIMIT ?"
+    params.append(safe_limit)
+    with CONVERSATION_LOCK, sqlite3.connect(CONVERSATION_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(query, tuple(params)).fetchall()
+        return [serialize_saved_analysis_row(row, include_content=include_content) for row in rows]
+
+
+def load_saved_analysis(analysis_id: Any) -> dict[str, Any] | None:
+    init_conversation_store()
+    normalized_id = normalize_saved_analysis_id(analysis_id)
+    if normalized_id is None:
+        return None
+    with CONVERSATION_LOCK, sqlite3.connect(CONVERSATION_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM saved_analyses WHERE id = ?", (normalized_id,)).fetchone()
+        if not row:
+            return None
+        return serialize_saved_analysis_row(row, include_content=True)
+
+
+def create_saved_analysis(body: dict[str, Any]) -> dict[str, Any]:
+    init_conversation_store()
+    customer_name = clip_text(str(body.get("customer_name") or body.get("customer") or "").strip(), 200)
+    if not customer_name:
+        raise ValueError("customer_name is required")
+    site_codes = normalize_site_codes(body.get("site_code") or body.get("site_codes") or "")
+    site_code = site_codes[0] if site_codes else ""
+    site_name = clip_text(str(body.get("site_name") or "").strip(), 200)
+    analysis_kind = clip_text(str(body.get("analysis_kind") or body.get("template") or "freeform").strip(), 60) or "freeform"
+    title = clip_text(
+        str(body.get("title") or body.get("question") or f"{customer_name or '미지정 고객'} 분석").strip(),
+        CONVERSATION_TITLE_CHAR_LIMIT,
+    ) or "저장 분석"
+    question = clip_text(str(body.get("question") or "").strip(), 600)
+    content = clip_text(body.get("content") or body.get("response") or "", SAVED_ANALYSIS_CONTENT_CHAR_LIMIT).strip()
+    source_excerpt = clip_text(body.get("source_excerpt") or body.get("data") or body.get("prompt") or "", SAVED_ANALYSIS_SOURCE_CHAR_LIMIT).strip()
+    if not content:
+        raise ValueError("content is required")
+    meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
+    now = utc_now()
+    with CONVERSATION_LOCK, sqlite3.connect(CONVERSATION_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            """
+            INSERT INTO saved_analyses (
+                customer_name, site_code, site_name, analysis_kind, title, question,
+                content, source_excerpt, created_at, updated_at, meta_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                customer_name,
+                site_code,
+                site_name,
+                analysis_kind,
+                title,
+                question,
+                content,
+                source_excerpt,
+                now,
+                now,
+                json.dumps(meta, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM saved_analyses WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        return serialize_saved_analysis_row(row, include_content=True)
+
+
+def delete_saved_analysis(analysis_id: Any) -> bool:
+    init_conversation_store()
+    normalized_id = normalize_saved_analysis_id(analysis_id)
+    if normalized_id is None:
+        return False
+    with CONVERSATION_LOCK, sqlite3.connect(CONVERSATION_DB_PATH) as conn:
+        result = conn.execute("DELETE FROM saved_analyses WHERE id = ?", (normalized_id,))
+        conn.commit()
+        return result.rowcount > 0
+
+
+def build_saved_analysis_context(customer_name: str, site_code: Any = "", limit: int = SAVED_ANALYSIS_CONTEXT_LIMIT) -> str:
+    normalized_customer = clip_text(str(customer_name or "").strip(), 200)
+    if not normalized_customer:
+        return ""
+    items = list_saved_analyses(
+        customer_name=normalized_customer,
+        site_code=site_code,
+        limit=max(1, min(int(limit or SAVED_ANALYSIS_CONTEXT_LIMIT), 8)),
+        include_content=True,
+    )
+    if not items:
+        return ""
+    lines = ["이전 저장 분석 참고자료"]
+    for index, item in enumerate(items, start=1):
+        scope = item.get("site_name") or item.get("site_code") or "전체 현장"
+        lines.append(
+            f"[{index}] {item.get('title') or '저장 분석'} / scope={scope} / kind={item.get('analysis_kind')} / updated={item.get('updated_at')}"
+        )
+        if item.get("question"):
+            lines.append(f"당시 요청: {item['question']}")
+        if item.get("source_excerpt"):
+            lines.append(f"당시 입력 요약:\n{clip_text(item['source_excerpt'], 700)}")
+        lines.append(f"당시 분석 결론:\n{clip_text(item.get('content') or '', 1400)}")
+    lines.append("위 자료는 참고 이력이다. 현재 입력 데이터와 충돌하면 현재 데이터와 최신 로그를 우선한다.")
+    return "\n\n".join(lines)
+
+
 def split_system_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     system_messages = []
     rest = []
@@ -528,6 +999,8 @@ def build_analysis_prompt(body: dict[str, Any]) -> list[dict[str, str]]:
     customer = body.get("customer") or "미지정 고객"
     question = body.get("question") or ""
     data = body.get("data") or body.get("logs") or ""
+    saved_context = str(body.get("saved_analysis_context") or "").strip()
+    attachments_context = str(body.get("attachments_context") or "").strip()
     if isinstance(data, (dict, list)):
         data_text = json.dumps(data, ensure_ascii=False, indent=2)
     else:
@@ -555,6 +1028,8 @@ def build_analysis_prompt(body: dict[str, Any]) -> list[dict[str, str]]:
     user_prompt = (
         f"고객사: {customer}\n"
         f"요청: {question or '제공된 데이터를 분석해줘.'}\n\n"
+        f"{f'이전 저장 분석 참고:\\n{saved_context}\\n\\n' if saved_context else ''}"
+        f"{f'외부 첨부자료 추출본:\\n{attachments_context}\\n\\n' if attachments_context else ''}"
         f"데이터:\n{data_text}\n\n"
         "출력 형식:\n"
         "1. 현재 판단\n"
@@ -665,7 +1140,13 @@ def build_nms_deterministic_brief(context: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def build_nms_analysis_prompt(context: dict[str, Any], question: str = "", depth: str = "deep") -> list[dict[str, str]]:
+def build_nms_analysis_prompt(
+    context: dict[str, Any],
+    question: str = "",
+    depth: str = "deep",
+    saved_context: str = "",
+    attachments_context: str = "",
+) -> list[dict[str, str]]:
     requested = context.get("requested") or {}
     matched = context.get("matched") or {}
     customer_names = ", ".join(matched.get("customer_names") or []) or requested.get("customer_name") or "전체"
@@ -684,9 +1165,13 @@ def build_nms_analysis_prompt(context: dict[str, Any], question: str = "", depth
         f"분석 모드: {depth}\n"
         f"요청: {question or '최근 관제 데이터 기준으로 이상 징후와 조치 우선순위를 판단해줘.'}\n\n"
         f"우선 적용할 근거 요약:\n{evidence_digest}\n\n"
+        f"{f'이전 저장 분석 참고:\\n{saved_context}\\n\\n' if saved_context else ''}"
+        f"{f'외부 첨부자료 추출본:\\n{attachments_context}\\n\\n' if attachments_context else ''}"
         f"NMS 컨텍스트 JSON:\n{data_text}\n\n"
         "분석 지침:\n"
         "- 먼저 전체 JSON을 훑고, matched/sites/devices/traffic/logs/temporal 순서로 근거를 정리한다.\n"
+        "- 이전 저장 분석은 참고용이다. 현재 로그/트래픽과 다른 부분이 있으면 차이를 먼저 설명한다.\n"
+        "- 첨부자료가 있으면 현재 NMS 원천값과 모순되는지 먼저 비교하고, 첨부자료의 수치/표/문장을 근거에 함께 반영한다.\n"
         "- temporal.off_hours와 temporal.nas_file_risk가 있으면 새벽 이벤트, 랜섬웨어성 파일 작업, 반복 시간대를 별도 판단한다.\n"
         "- temporal.nas_file_activity는 전체 시간대 NAS 파일작업이고, temporal.nas_file_risk는 새벽 시간대 파일작업이다. 둘을 반드시 분리해서 설명해라.\n"
         "- Grafana 화면은 NMS DB를 시각화한 것이므로, Grafana 값이라고 표현할 때도 JSON의 traffic/logs/temporal 원천값을 근거로 삼는다.\n"
@@ -999,7 +1484,8 @@ class NmsAutopilot:
             "상시 모니터링 자동 점검이다. 최근 NMS/Grafana 원천값을 근거로 "
             "장애/보안/랜섬웨어/장비 불량 가능성과 다음 조치를 실무적으로 판단해라."
         )
-        prompt_messages = build_nms_analysis_prompt(context, question, "deep")
+        saved_context = build_saved_analysis_context(customer_name, site_codes, limit=SAVED_ANALYSIS_CONTEXT_LIMIT)
+        prompt_messages = build_nms_analysis_prompt(context, question, "deep", saved_context)
         system_messages, current_messages = split_system_messages(prompt_messages)
         history = conversation_history_for_model(conversation["id"], limit=min(CONVERSATION_HISTORY_LIMIT, 8))
         messages = [*system_messages, *history, *current_messages]
@@ -1121,6 +1607,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return self.json_response({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
             return self.handle_conversations_get(route, requestUrl=urllib.parse.urlparse(self.path))
+        if route == "/api/saved-analyses" or route.startswith("/api/saved-analyses/"):
+            if not self.authorized():
+                return self.json_response({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return self.handle_saved_analyses_get(route, requestUrl=urllib.parse.urlparse(self.path))
         if route.startswith("/api/nms/"):
             if not self.authorized():
                 return self.json_response({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
@@ -1140,9 +1630,21 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_create_conversation(body)
         if route.startswith("/api/conversations/"):
             return self.handle_conversations_post(route, body)
+        if route == "/api/saved-analyses":
+            return self.handle_create_saved_analysis(body)
         if route == "/api/chat":
             return self.handle_chat(body)
         if route == "/api/analyze":
+            attachment_context = self.prepare_attachment_context(body)
+            if attachment_context is None:
+                return
+            body["attachment_context"] = attachment_context
+            body["attachments_context"] = attachment_context.get("text") or ""
+            body["saved_analysis_context"] = build_saved_analysis_context(
+                str(body.get("customer") or body.get("customer_name") or "").strip(),
+                body.get("site_code") or body.get("site_codes") or "",
+                limit=int(body.get("saved_analysis_limit") or SAVED_ANALYSIS_CONTEXT_LIMIT),
+            )
             body["messages"] = build_analysis_prompt(body)
             return self.handle_chat(body)
         if route == "/api/nms/analyze":
@@ -1166,6 +1668,10 @@ class Handler(BaseHTTPRequestHandler):
         if route.startswith("/api/conversations/"):
             conversation_id = route.rsplit("/", 1)[-1]
             deleted = delete_conversation(conversation_id)
+            return self.json_response({"success": deleted, "deleted": deleted}, HTTPStatus.OK if deleted else HTTPStatus.NOT_FOUND)
+        if route.startswith("/api/saved-analyses/"):
+            analysis_id = route.rsplit("/", 1)[-1]
+            deleted = delete_saved_analysis(analysis_id)
             return self.json_response({"success": deleted, "deleted": deleted}, HTTPStatus.OK if deleted else HTTPStatus.NOT_FOUND)
         return self.json_response({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -1200,6 +1706,41 @@ class Handler(BaseHTTPRequestHandler):
                 conn.commit()
             return self.json_response({"success": True, "conversation_id": conversation["id"]})
         return self.json_response({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+    def handle_saved_analyses_get(self, route: str, requestUrl: urllib.parse.ParseResult) -> None:
+        params = urllib.parse.parse_qs(requestUrl.query)
+        first = lambda key, default="": (params.get(key) or [default])[0]
+        if route == "/api/saved-analyses":
+            items = list_saved_analyses(
+                customer_name=first("customer_name"),
+                site_code=first("site_code") or first("site_codes"),
+                limit=int(first("limit", "50") or "50"),
+                include_content=False,
+            )
+            return self.json_response({"success": True, "count": len(items), "items": items})
+        analysis_id = route.rsplit("/", 1)[-1]
+        item = load_saved_analysis(analysis_id)
+        if not item:
+            return self.json_response({"error": "saved analysis not found"}, HTTPStatus.NOT_FOUND)
+        return self.json_response({"success": True, "item": item})
+
+    def handle_create_saved_analysis(self, body: dict[str, Any]) -> None:
+        try:
+            item = create_saved_analysis(body)
+        except ValueError as exc:
+            return self.json_response({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        return self.json_response({"success": True, "item": item}, HTTPStatus.CREATED)
+
+    def prepare_attachment_context(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        try:
+            context = extract_attachments_context(body.get("attachments") or [])
+            if body.get("attachments") and not context.get("items"):
+                detail = "; ".join(context.get("errors") or []) or "no readable attachments"
+                raise ValueError(f"no readable attachments: {detail}")
+            return context
+        except ValueError as exc:
+            self.json_response({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return None
 
     def handle_openai_models(self) -> None:
         status = ollama_status()
@@ -1359,6 +1900,8 @@ class Handler(BaseHTTPRequestHandler):
             "response": response_text,
             "raw": result["data"],
             "gpu": gpu_status(),
+            "attachment_summary": (body.get("attachment_context") or {}).get("items") if isinstance(body.get("attachment_context"), dict) else [],
+            "attachment_errors": (body.get("attachment_context") or {}).get("errors") if isinstance(body.get("attachment_context"), dict) else [],
             "time": utc_now(),
         }
         status = HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY
@@ -1428,7 +1971,23 @@ class Handler(BaseHTTPRequestHandler):
         if not result["ok"]:
             return self.json_response(result["data"], HTTPStatus.BAD_GATEWAY)
 
-        body["messages"] = build_nms_analysis_prompt(result["data"], str(body.get("question") or ""), depth)
+        attachment_context = self.prepare_attachment_context(body)
+        if attachment_context is None:
+            return
+        body["attachment_context"] = attachment_context
+        body["attachments_context"] = attachment_context.get("text") or ""
+        body["saved_analysis_context"] = build_saved_analysis_context(
+            customer_name or ", ".join((result["data"].get("matched") or {}).get("customer_names") or []),
+            site_codes,
+            limit=int(body.get("saved_analysis_limit") or SAVED_ANALYSIS_CONTEXT_LIMIT),
+        )
+        body["messages"] = build_nms_analysis_prompt(
+            result["data"],
+            str(body.get("question") or ""),
+            depth,
+            str(body.get("saved_analysis_context") or ""),
+            str(body.get("attachments_context") or ""),
+        )
         body["prepend_report"] = build_nms_deterministic_brief(result["data"])
         body["conversation_store_messages"] = [
             {
@@ -1707,13 +2266,40 @@ INDEX_HTML = r"""<!doctype html>
           <span>모니터링 상태</span><b>확인 전</b>
         </div>
       </div>
+      <div class="card stack">
+        <div class="row" style="justify-content:space-between">
+          <strong>업체/현장 분석 보관함</strong>
+          <span id="savedAnalysisCount" class="pill warn">0건</span>
+        </div>
+        <div class="grid2">
+          <div>
+            <label>저장 제목</label>
+            <input id="savedAnalysisTitle" placeholder="예: 돈우 5월 장애 분석 1차" />
+          </div>
+          <div>
+            <label>저장 분석</label>
+            <select id="savedAnalysisSelect">
+              <option value="">고객사/현장 선택 후 불러오기</option>
+            </select>
+          </div>
+        </div>
+        <div id="savedAnalysisStatus" class="metric">
+          <span>현재 범위</span><b style="font-size:14px">고객사/현장을 선택하세요.</b>
+        </div>
+        <div class="row">
+          <button class="secondary" onclick="loadSavedAnalyses()">목록 새로고침</button>
+          <button class="secondary" onclick="saveCurrentAnalysis()">현재 결과 저장</button>
+          <button class="secondary" onclick="loadSavedAnalysis()">선택 불러오기</button>
+          <button class="secondary" onclick="deleteSavedAnalysis()">선택 삭제</button>
+        </div>
+      </div>
     </section>
     <section class="stack">
       <div class="card stack">
         <div class="grid2">
           <div>
             <label>고객사</label>
-            <input id="customer" placeholder="예: (주)농업회사법인돈우" />
+            <input id="customer" placeholder="예: (주)농업회사법인돈우" onchange="loadSavedAnalyses(true)" />
           </div>
           <div>
             <label>요청</label>
@@ -1724,9 +2310,19 @@ INDEX_HTML = r"""<!doctype html>
           <label>프롬프트 / 로그 / JSON 데이터</label>
           <textarea id="prompt" placeholder="여기에 NMS 이벤트, 작업일지, 로그, 질문을 넣습니다."></textarea>
         </div>
+        <div class="grid2">
+          <div>
+            <label>외부 첨부자료 (CSV, XLS, XLSX, DOC, DOCX, TXT)</label>
+            <input id="analysisAttachments" type="file" multiple accept=".csv,.xls,.xlsx,.doc,.docx,.txt,.log" onchange="renderAttachmentSummary()" />
+          </div>
+          <div id="attachmentSummary" class="metric">
+            <span>첨부 상태</span><b style="font-size:14px">선택된 파일 없음</b>
+          </div>
+        </div>
         <div class="row">
           <button onclick="analyze()">분석 실행</button>
           <button class="secondary" onclick="chat()">일반 채팅</button>
+          <button class="secondary" onclick="clearAttachments()">첨부 비우기</button>
           <button class="secondary" onclick="refresh()">상태 새로고침</button>
         </div>
       </div>
@@ -1737,10 +2333,14 @@ INDEX_HTML = r"""<!doctype html>
     const $ = (id) => document.getElementById(id);
     const tokenKey = "metro_llm_ops_token";
     const conversationKey = "metro_llm_ops_conversation_id";
+    const maxAttachmentCount = 5;
+    const maxAttachmentFileBytes = 5 * 1024 * 1024;
+    const maxAttachmentTotalBytes = 12 * 1024 * 1024;
     let nmsCustomers = [];
     let nmsMonitorTimer = null;
     let healthTimer = null;
     let conversations = [];
+    let savedAnalyses = [];
     let currentConversationId = localStorage.getItem(conversationKey) || "";
     $("token").value = localStorage.getItem(tokenKey) || "";
 
@@ -1750,6 +2350,7 @@ INDEX_HTML = r"""<!doctype html>
       loadConversations();
       loadNmsCustomers();
       refreshNmsMonitor();
+      loadSavedAnalyses(true);
     }
 
     function headers() {
@@ -1762,6 +2363,87 @@ INDEX_HTML = r"""<!doctype html>
 
     function setResult(value) {
       $("result").textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+    }
+
+    function formatBytes(bytes) {
+      if (!bytes) return "0 B";
+      const units = ["B", "KB", "MB", "GB"];
+      let value = bytes;
+      let unitIndex = 0;
+      while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex += 1;
+      }
+      return `${value.toFixed(value >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+    }
+
+    function attachmentFiles() {
+      return Array.from($("analysisAttachments").files || []);
+    }
+
+    function attachmentSummaryText() {
+      return attachmentFiles().map((file) => `${file.name} (${formatBytes(file.size)})`).join(", ");
+    }
+
+    function renderAttachmentSummary(message = "") {
+      const files = attachmentFiles();
+      const totalBytes = files.reduce((sum, file) => sum + (file.size || 0), 0);
+      const text = files.length
+        ? `${files.length}개 / ${formatBytes(totalBytes)} · ${attachmentSummaryText()}`
+        : (message || "선택된 파일 없음");
+      $("attachmentSummary").innerHTML = `
+        <span>첨부 상태</span>
+        <b style="font-size:14px">${text}</b>
+      `;
+    }
+
+    function clearAttachments() {
+      $("analysisAttachments").value = "";
+      renderAttachmentSummary("선택된 파일 없음");
+    }
+
+    function arrayBufferToBase64(buffer) {
+      const bytes = new Uint8Array(buffer);
+      const chunkSize = 0x8000;
+      let binary = "";
+      for (let index = 0; index < bytes.length; index += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+      }
+      return btoa(binary);
+    }
+
+    async function collectAttachmentPayloads() {
+      const files = attachmentFiles();
+      if (!files.length) return [];
+      if (files.length > maxAttachmentCount) {
+        throw new Error(`첨부파일은 최대 ${maxAttachmentCount}개까지 가능합니다.`);
+      }
+      const totalBytes = files.reduce((sum, file) => sum + (file.size || 0), 0);
+      if (totalBytes > maxAttachmentTotalBytes) {
+        throw new Error(`첨부파일 전체 크기는 ${formatBytes(maxAttachmentTotalBytes)} 이하여야 합니다.`);
+      }
+      const payloads = [];
+      for (const file of files) {
+        if ((file.size || 0) > maxAttachmentFileBytes) {
+          throw new Error(`${file.name} 파일이 너무 큽니다. 파일당 ${formatBytes(maxAttachmentFileBytes)} 이하만 가능합니다.`);
+        }
+        const buffer = await file.arrayBuffer();
+        payloads.push({
+          name: file.name,
+          type: file.type || "",
+          size: file.size || 0,
+          content_base64: arrayBufferToBase64(buffer),
+        });
+      }
+      return payloads;
+    }
+
+    function renderResponseWithAttachmentWarnings(data) {
+      let text = data.response || JSON.stringify(data, null, 2);
+      if (Array.isArray(data.attachment_errors) && data.attachment_errors.length) {
+        text += `\n\n[첨부 처리 경고]\n- ${data.attachment_errors.join("\n- ")}`;
+      }
+      return text;
     }
 
     async function api(path, options = {}) {
@@ -1829,6 +2511,172 @@ INDEX_HTML = r"""<!doctype html>
         localStorage.setItem(conversationKey, currentConversationId);
         loadConversations();
       }
+    }
+
+    function selectedSiteDetails() {
+      const customer = selectedCustomer();
+      const siteCode = $("nmsSite").value;
+      if (!customer || !siteCode) {
+        return {site_code: siteCode || "", site_name: ""};
+      }
+      const site = (customer.sites || []).find((item) => item.site_code === siteCode) || {};
+      return {
+        site_code: siteCode,
+        site_name: site.site_name || "",
+      };
+    }
+
+    function analysisScope() {
+      const customerName = $("customer").value.trim() || (selectedCustomer()?.customer_name || "").trim();
+      const site = selectedSiteDetails();
+      return {
+        customer_name: customerName,
+        site_code: site.site_code || "",
+        site_name: site.site_name || "",
+      };
+    }
+
+    function updateSavedAnalysisStatus(extra = "") {
+      const scope = analysisScope();
+      const customerLabel = scope.customer_name || "고객사 미지정";
+      const siteLabel = scope.site_name || scope.site_code || "전체 현장";
+      $("savedAnalysisCount").className = savedAnalyses.length ? "pill" : "pill warn";
+      $("savedAnalysisCount").textContent = `${savedAnalyses.length}건`;
+      $("savedAnalysisStatus").innerHTML = `
+        <span>현재 범위</span>
+        <b style="font-size:14px">${customerLabel} / ${siteLabel}${extra ? ` · ${extra}` : ""}</b>
+      `;
+    }
+
+    function renderSavedAnalyses(selectedId = "") {
+      const select = $("savedAnalysisSelect");
+      select.innerHTML = '<option value="">저장 분석 선택</option>';
+      for (const item of savedAnalyses) {
+        const opt = document.createElement("option");
+        opt.value = String(item.id);
+        const scope = item.site_name || item.site_code || "전체";
+        const updatedAt = String(item.updated_at || "").replace("T", " ").replace("Z", "").slice(0, 16);
+        opt.textContent = `${item.title || "저장 분석"} / ${scope} / ${updatedAt}`;
+        if (String(item.id) === String(selectedId)) opt.selected = true;
+        select.appendChild(opt);
+      }
+      updateSavedAnalysisStatus(savedAnalyses.length ? `최근 ${savedAnalyses[0].updated_at || "-"}` : "저장 없음");
+    }
+
+    async function loadSavedAnalyses(silent = false) {
+      const scope = analysisScope();
+      if (!scope.customer_name) {
+        savedAnalyses = [];
+        renderSavedAnalyses();
+        updateSavedAnalysisStatus("고객사 입력 필요");
+        return;
+      }
+      try {
+        const query = new URLSearchParams({
+          customer_name: scope.customer_name,
+          limit: "50",
+        });
+        if (scope.site_code) query.set("site_code", scope.site_code);
+        const data = await api(`/api/saved-analyses?${query.toString()}`, {headers: headers()});
+        const selectedId = $("savedAnalysisSelect").value;
+        savedAnalyses = data.items || [];
+        renderSavedAnalyses(selectedId);
+        if (!silent) {
+          updateSavedAnalysisStatus(savedAnalyses.length ? "저장 분석을 불러왔습니다." : "저장 분석이 없습니다.");
+        }
+      } catch (err) {
+        if (!silent) setResult(`저장 분석을 불러오지 못했습니다.\n${String(err)}`);
+        console.warn("saved analysis load failed", err);
+      }
+    }
+
+    async function saveCurrentAnalysis() {
+      const scope = analysisScope();
+      const content = $("result").textContent.trim();
+      if (!scope.customer_name) {
+        setResult("저장할 고객사를 먼저 선택하거나 입력하세요.");
+        return;
+      }
+      if (!content || content === "대기 중입니다." || content === "분석 중..." || content === "생성 중...") {
+        setResult("저장할 분석 결과가 없습니다.");
+        return;
+      }
+      const title = $("savedAnalysisTitle").value.trim() || $("question").value.trim() || `${scope.customer_name} 분석`;
+      const attachmentNote = attachmentSummaryText();
+      const data = await api("/api/saved-analyses", {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify({
+          customer_name: scope.customer_name,
+          site_code: scope.site_code,
+          site_name: scope.site_name,
+          analysis_kind: $("template").value,
+          title,
+          question: $("question").value.trim(),
+          content,
+          source_excerpt: [
+            attachmentNote ? `[첨부파일]\n${attachmentNote}` : "",
+            $("prompt").value.trim(),
+          ].filter(Boolean).join("\n\n"),
+          meta: {
+            model: $("model").value,
+            template: $("template").value,
+            conversation_id: currentConversationId || "",
+            source: "llm-ops-ui",
+          },
+        }),
+      });
+      $("savedAnalysisTitle").value = data.item.title || title;
+      await loadSavedAnalyses(true);
+      renderSavedAnalyses(data.item.id);
+      updateSavedAnalysisStatus("현재 결과를 저장했습니다.");
+    }
+
+    async function loadSavedAnalysis() {
+      const analysisId = $("savedAnalysisSelect").value;
+      if (!analysisId) {
+        setResult("불러올 저장 분석을 선택하세요.");
+        return;
+      }
+      const data = await api(`/api/saved-analyses/${analysisId}`, {headers: headers()});
+      const item = data.item || {};
+      if (item.customer_name) {
+        $("customer").value = item.customer_name;
+        const customer = nmsCustomers.find((entry) => entry.customer_name === item.customer_name);
+        if (customer) {
+          $("nmsCustomer").value = customer.customer_name;
+          selectNmsCustomer();
+          if (item.site_code) {
+            $("nmsSite").value = item.site_code;
+            selectNmsSite();
+          }
+        }
+      }
+      if (item.analysis_kind && [...$("template").options].some((opt) => opt.value === item.analysis_kind)) {
+        $("template").value = item.analysis_kind;
+      }
+      $("savedAnalysisTitle").value = item.title || "";
+      $("question").value = item.question || $("question").value;
+      $("prompt").value = item.source_excerpt || $("prompt").value;
+      setResult(item.content || "저장 내용이 없습니다.");
+      updateSavedAnalysisStatus(`선택 분석 ${item.id}번을 불러왔습니다.`);
+      await loadSavedAnalyses(true);
+      renderSavedAnalyses(item.id);
+    }
+
+    async function deleteSavedAnalysis() {
+      const analysisId = $("savedAnalysisSelect").value;
+      if (!analysisId) {
+        setResult("삭제할 저장 분석을 선택하세요.");
+        return;
+      }
+      await api(`/api/saved-analyses/${analysisId}`, {
+        method: "DELETE",
+        headers: headers(),
+      });
+      await loadSavedAnalyses(true);
+      $("savedAnalysisTitle").value = "";
+      updateSavedAnalysisStatus("선택 저장 분석을 삭제했습니다.");
     }
 
     function renderHealthMetrics(health, runningModels = null) {
@@ -1954,7 +2802,10 @@ INDEX_HTML = r"""<!doctype html>
       const customer = selectedCustomer();
       const siteSelect = $("nmsSite");
       siteSelect.innerHTML = '<option value="">전체 현장</option>';
-      if (!customer) return;
+      if (!customer) {
+        loadSavedAnalyses(true);
+        return;
+      }
       $("customer").value = customer.customer_name;
       for (const site of customer.sites || []) {
         const opt = document.createElement("option");
@@ -1962,11 +2813,13 @@ INDEX_HTML = r"""<!doctype html>
         opt.textContent = `${site.site_name} / ${site.site_code} (${site.recent_event_count || 0})`;
         siteSelect.appendChild(opt);
       }
+      loadSavedAnalyses(true);
     }
 
     function selectNmsSite() {
       const customer = selectedCustomer();
       if (customer) $("customer").value = customer.customer_name;
+      loadSavedAnalyses(true);
     }
 
     async function loadNmsContext() {
@@ -2002,24 +2855,31 @@ INDEX_HTML = r"""<!doctype html>
         setResult("업체 또는 현장을 먼저 선택하세요.");
         return;
       }
-      setResult("33 NMS 데이터 분석 중...");
-      const data = await api("/api/nms/analyze", {
-        method: "POST",
-        headers: headers(),
-        body: JSON.stringify(conversationPayload({
-          model: $("model").value,
-          customer_name: customer?.customer_name || "",
-          site_codes: siteCode || (customer?.sites || []).map(s => s.site_code),
-          question: $("question").value,
-          hours: 48,
-          limit: 80,
-          depth: "deep",
-          source: "nms-analysis",
-        })),
-      });
-      applyConversationFromResponse(data);
-      setResult(data.response || data);
-      refresh();
+      try {
+        setResult("33 NMS 데이터 분석 중...");
+        const attachments = await collectAttachmentPayloads();
+        const data = await api("/api/nms/analyze", {
+          method: "POST",
+          headers: headers(),
+          body: JSON.stringify(conversationPayload({
+            model: $("model").value,
+            customer_name: customer?.customer_name || "",
+            site_codes: siteCode || (customer?.sites || []).map(s => s.site_code),
+            question: $("question").value,
+            hours: 48,
+            limit: 80,
+            depth: "deep",
+            attachments,
+            source: "nms-analysis",
+          })),
+        });
+        applyConversationFromResponse(data);
+        setResult(renderResponseWithAttachmentWarnings(data));
+        $("savedAnalysisTitle").value ||= $("question").value.trim() || `${$("customer").value.trim() || "고객"} NMS 분석`;
+        refresh();
+      } catch (err) {
+        setResult(String(err));
+      }
     }
 
     function toggleNmsMonitor() {
@@ -2048,27 +2908,35 @@ INDEX_HTML = r"""<!doctype html>
       });
       applyConversationFromResponse(data);
       setResult(data.response || data);
+      $("savedAnalysisTitle").value ||= $("question").value.trim() || `${$("customer").value.trim() || "고객"} 분석`;
       refresh();
     }
 
     async function analyze() {
-      setResult("분석 중...");
-      const data = await api("/api/analyze", {
-        method: "POST",
-        headers: headers(),
-        body: JSON.stringify(conversationPayload({
-          model: $("model").value,
-          template: $("template").value,
-          customer: $("customer").value,
-          question: $("question").value,
-          data: $("prompt").value,
-          temperature: 0.15,
-          source: "template-analysis",
-        })),
-      });
-      applyConversationFromResponse(data);
-      setResult(data.response || data);
-      refresh();
+      try {
+        setResult("분석 중...");
+        const attachments = await collectAttachmentPayloads();
+        const data = await api("/api/analyze", {
+          method: "POST",
+          headers: headers(),
+          body: JSON.stringify(conversationPayload({
+            model: $("model").value,
+            template: $("template").value,
+            customer: $("customer").value,
+            question: $("question").value,
+            data: $("prompt").value,
+            attachments,
+            temperature: 0.15,
+            source: "template-analysis",
+          })),
+        });
+        applyConversationFromResponse(data);
+        setResult(renderResponseWithAttachmentWarnings(data));
+        $("savedAnalysisTitle").value ||= $("question").value.trim() || `${$("customer").value.trim() || "고객"} 분석`;
+        refresh();
+      } catch (err) {
+        setResult(String(err));
+      }
     }
 
     async function preload() {
@@ -2109,6 +2977,8 @@ INDEX_HTML = r"""<!doctype html>
     loadConversations();
     refreshNmsMonitor();
     loadNmsCustomers();
+    loadSavedAnalyses(true);
+    renderAttachmentSummary();
     toggleNmsMonitor();
   </script>
 </body>
