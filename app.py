@@ -61,6 +61,10 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip(
 API_TOKEN = os.getenv("LLM_OPS_TOKEN", "")
 DEFAULT_MODEL = os.getenv("LLM_OPS_DEFAULT_MODEL", "metro-report:latest")
 FAST_MODEL = os.getenv("LLM_OPS_FAST_MODEL", "metro-fast:latest")
+DEFAULT_CHAT_SYSTEM_PROMPT = os.getenv(
+    "LLM_OPS_DEFAULT_CHAT_SYSTEM_PROMPT",
+    "기본 응답 언어는 한국어다. 사용자가 다른 언어를 명시적으로 요청하지 않으면 자연스럽고 간결한 한국어로 답해라.",
+)
 REQUEST_TIMEOUT = int(os.getenv("LLM_OPS_REQUEST_TIMEOUT_SECONDS", "600"))
 MAX_BODY_BYTES = int(os.getenv("LLM_OPS_MAX_BODY_BYTES", str(16 * 1024 * 1024)))
 KEEP_ALIVE = os.getenv("LLM_OPS_KEEP_ALIVE", "30m")
@@ -255,7 +259,7 @@ def fallback_strings_text(raw: bytes, suffix: str) -> str:
         return proc.stdout.strip()
 
 
-def libreoffice_text(raw: bytes, suffix: str) -> str:
+def libreoffice_convert(raw: bytes, suffix: str, target_ext: str, filter_name: str = "") -> str:
     libreoffice_cmd = shutil.which("libreoffice") or shutil.which("soffice")
     if not libreoffice_cmd:
         raise RuntimeError("libreoffice not installed")
@@ -263,12 +267,13 @@ def libreoffice_text(raw: bytes, suffix: str) -> str:
         temp_path = Path(tempdir)
         source_path = temp_path / f"attachment{suffix or '.bin'}"
         source_path.write_bytes(raw)
+        convert_arg = f"{target_ext}:{filter_name}" if filter_name else target_ext
         proc = subprocess.run(
             [
                 libreoffice_cmd,
                 "--headless",
                 "--convert-to",
-                "txt:Text",
+                convert_arg,
                 "--outdir",
                 str(temp_path),
                 str(source_path),
@@ -278,10 +283,19 @@ def libreoffice_text(raw: bytes, suffix: str) -> str:
             text=True,
             timeout=90,
         )
-        text_path = source_path.with_suffix(".txt")
-        if not text_path.exists():
+        output_path = source_path.with_suffix(f".{target_ext}")
+        if not output_path.exists():
             raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "libreoffice conversion failed")
-        return text_path.read_text(encoding="utf-8", errors="replace")
+        return output_path.read_text(encoding="utf-8", errors="replace")
+
+
+def libreoffice_text(raw: bytes, suffix: str) -> str:
+    return libreoffice_convert(raw, suffix, "txt", "Text")
+
+
+def libreoffice_spreadsheet_text(raw: bytes, suffix: str) -> str:
+    converted = libreoffice_convert(raw, suffix, "csv", "Text - txt - csv (StarCalc)")
+    return extract_csv_text(converted.encode("utf-8"))
 
 
 def extract_attachment_text(name: str, raw: bytes) -> tuple[str, str]:
@@ -296,6 +310,8 @@ def extract_attachment_text(name: str, raw: bytes) -> tuple[str, str]:
         return extract_xlsx_text(raw), "xlsx"
     if suffix in {".doc", ".xls"}:
         try:
+            if suffix == ".xls":
+                return libreoffice_spreadsheet_text(raw, suffix), "libreoffice-csv"
             return libreoffice_text(raw, suffix), "libreoffice"
         except Exception:
             return fallback_strings_text(raw, suffix), "strings"
@@ -838,6 +854,23 @@ def split_system_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str
         elif role in {"user", "assistant", "tool"}:
             rest.append(normalized)
     return system_messages, rest
+
+
+def ensure_default_chat_system_message(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    normalized = []
+    has_system = False
+    for message in messages:
+        role = str(message.get("role") or "").strip()
+        content = str(message.get("content") or "")
+        if not content:
+            continue
+        normalized_message = {"role": role, "content": content}
+        normalized.append(normalized_message)
+        if role == "system":
+            has_system = True
+    if has_system or not DEFAULT_CHAT_SYSTEM_PROMPT.strip():
+        return normalized
+    return [{"role": "system", "content": DEFAULT_CHAT_SYSTEM_PROMPT}, *normalized]
 
 
 def conversation_history_for_model(conversation_id: str, limit: int = CONVERSATION_HISTORY_LIMIT) -> list[dict[str, str]]:
@@ -1633,6 +1666,33 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/saved-analyses":
             return self.handle_create_saved_analysis(body)
         if route == "/api/chat":
+            attachment_context = self.prepare_attachment_context(body)
+            if attachment_context is None:
+                return
+            body["attachment_context"] = attachment_context
+            if attachment_context.get("text"):
+                body["attachments_context"] = attachment_context.get("text") or ""
+                if isinstance(body.get("messages"), list):
+                    body["messages"] = [
+                        {
+                            "role": "user",
+                            "content": (
+                                "첨부자료 추출본을 먼저 참고해라. 현재 대화와 충돌하면 사용자의 최신 지시를 우선한다.\n\n"
+                                f"{body['attachments_context']}"
+                            ),
+                        },
+                        *[
+                            message
+                            for message in body.get("messages") or []
+                            if isinstance(message, dict)
+                        ],
+                    ]
+                else:
+                    prompt = str(body.get("prompt") or "").strip()
+                    body["prompt"] = (
+                        f"첨부자료 추출본:\n{body['attachments_context']}\n\n"
+                        f"사용자 입력:\n{prompt or '첨부자료를 참고해서 답해줘.'}"
+                    )
             return self.handle_chat(body)
         if route == "/api/analyze":
             attachment_context = self.prepare_attachment_context(body)
@@ -1832,11 +1892,14 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(messages, list):
             return {"error": "messages must be a list"}, HTTPStatus.BAD_REQUEST
 
-        current_messages = [
-            {"role": str(message.get("role") or ""), "content": str(message.get("content") or "")}
-            for message in messages
-            if isinstance(message, dict) and str(message.get("content") or "")
-        ]
+        current_messages = ensure_default_chat_system_message(
+            [
+                {"role": str(message.get("role") or ""), "content": str(message.get("content") or "")}
+                for message in messages
+                if isinstance(message, dict) and str(message.get("content") or "")
+            ]
+        )
+        messages = current_messages
         conversation_id = normalize_conversation_id(body.get("conversation_id") or body.get("thread_id") or "")
         remember = bool(conversation_id or body.get("remember") or body.get("persist"))
         conversation = None
@@ -2895,21 +2958,27 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function chat() {
-      setResult("생성 중...");
-      const data = await api("/api/chat", {
-        method: "POST",
-        headers: headers(),
-        body: JSON.stringify(conversationPayload({
-          model: $("model").value,
-          prompt: $("prompt").value,
-          temperature: 0.2,
-          source: "free-chat",
-        })),
-      });
-      applyConversationFromResponse(data);
-      setResult(data.response || data);
-      $("savedAnalysisTitle").value ||= $("question").value.trim() || `${$("customer").value.trim() || "고객"} 분석`;
-      refresh();
+      try {
+        setResult("생성 중...");
+        const attachments = await collectAttachmentPayloads();
+        const data = await api("/api/chat", {
+          method: "POST",
+          headers: headers(),
+          body: JSON.stringify(conversationPayload({
+            model: $("model").value,
+            prompt: $("prompt").value,
+            attachments,
+            temperature: 0.2,
+            source: "free-chat",
+          })),
+        });
+        applyConversationFromResponse(data);
+        setResult(renderResponseWithAttachmentWarnings(data));
+        $("savedAnalysisTitle").value ||= $("question").value.trim() || `${$("customer").value.trim() || "고객"} 분석`;
+        refresh();
+      } catch (err) {
+        setResult(String(err));
+      }
     }
 
     async function analyze() {
