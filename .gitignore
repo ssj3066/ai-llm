@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+llm-ops.env
+data/
+
+.backup-*/
+app.py.backup-*
