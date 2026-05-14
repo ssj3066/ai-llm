@@ -14,6 +14,7 @@ import json
 import os
 import base64
 import html
+import re
 import shutil
 import socket
 import sqlite3
@@ -65,10 +66,25 @@ DEFAULT_CHAT_SYSTEM_PROMPT = os.getenv(
     "LLM_OPS_DEFAULT_CHAT_SYSTEM_PROMPT",
     "기본 응답 언어는 한국어다. 사용자가 다른 언어를 명시적으로 요청하지 않으면 자연스럽고 간결한 한국어로 답해라.",
 )
+KOREAN_RESPONSE_GUARD = (
+    "중요: 사용자가 다른 언어를 명시적으로 요청하지 않으면 반드시 한국어로만 답한다. "
+    "중국어, 영어, 일본어로 시작하지 말고 첫 문장부터 한국어로 작성한다."
+)
 REQUEST_TIMEOUT = int(os.getenv("LLM_OPS_REQUEST_TIMEOUT_SECONDS", "600"))
 MAX_BODY_BYTES = int(os.getenv("LLM_OPS_MAX_BODY_BYTES", str(16 * 1024 * 1024)))
 KEEP_ALIVE = os.getenv("LLM_OPS_KEEP_ALIVE", "30m")
 ALLOWED_ORIGIN = os.getenv("LLM_OPS_ALLOWED_ORIGIN", "*")
+MODEL_FALLBACK_ENABLED = os.getenv("LLM_OPS_MODEL_FALLBACK_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+MODEL_RUNNING_SWITCH_GUARD_ENABLED = os.getenv(
+    "LLM_OPS_MODEL_RUNNING_SWITCH_GUARD_ENABLED",
+    "false",
+).strip().lower() not in {"0", "false", "no", "off"}
+MODEL_AUTO_UNLOAD_BEFORE_SWITCH_ENABLED = os.getenv(
+    "LLM_OPS_MODEL_AUTO_UNLOAD_BEFORE_SWITCH_ENABLED",
+    "true",
+).strip().lower() not in {"0", "false", "no", "off"}
+MODEL_SWITCH_UNLOAD_TIMEOUT = int(os.getenv("LLM_OPS_MODEL_SWITCH_UNLOAD_TIMEOUT_SECONDS", "60"))
+KOREAN_RETRY_ENABLED = os.getenv("LLM_OPS_KOREAN_RETRY_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 NMS_CONTEXT_BASE_URL = os.getenv("NMS_CONTEXT_BASE_URL", "http://192.168.1.33:7443").rstrip("/")
 NMS_CONTEXT_TOKEN = os.getenv("NMS_CONTEXT_TOKEN", "")
 NMS_CONTEXT_TIMEOUT = int(os.getenv("NMS_CONTEXT_TIMEOUT_SECONDS", "12"))
@@ -840,6 +856,10 @@ def build_saved_analysis_context(customer_name: str, site_code: Any = "", limit:
     return "\n\n".join(lines)
 
 
+def is_network_evidence_pack(context: dict[str, Any]) -> bool:
+    return str((context or {}).get("evidence_pack_version") or "").startswith("network-evidence-pack")
+
+
 def split_system_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     system_messages = []
     rest = []
@@ -868,9 +888,69 @@ def ensure_default_chat_system_message(messages: list[dict[str, Any]]) -> list[d
         normalized.append(normalized_message)
         if role == "system":
             has_system = True
+    guard_messages = []
+    if KOREAN_RESPONSE_GUARD.strip():
+        guard_messages.append({"role": "system", "content": KOREAN_RESPONSE_GUARD})
     if has_system or not DEFAULT_CHAT_SYSTEM_PROMPT.strip():
-        return normalized
-    return [{"role": "system", "content": DEFAULT_CHAT_SYSTEM_PROMPT}, *normalized]
+        return [*guard_messages, *normalized]
+    return [*guard_messages, {"role": "system", "content": DEFAULT_CHAT_SYSTEM_PROMPT}, *normalized]
+
+
+def contains_hangul(text: Any) -> bool:
+    return any("가" <= ch <= "힣" for ch in str(text or ""))
+
+
+def starts_with_non_korean_response(text: Any) -> bool:
+    stripped = str(text or "").lstrip()
+    if not stripped:
+        return False
+    first = stripped[0]
+    chinese_openers = ("明白", "好的", "当然", "理解", "是的", "可以")
+    english_openers = ("sure", "okay", "ok,", "yes", "understood", "certainly")
+    if any(stripped.startswith(prefix) for prefix in chinese_openers):
+        return True
+    if first.isascii() and stripped.lower().startswith(english_openers):
+        return True
+    return not contains_hangul(stripped[:120])
+
+
+def should_retry_korean_response(messages: list[dict[str, str]], response_text: Any) -> bool:
+    if not KOREAN_RETRY_ENABLED:
+        return False
+    if not starts_with_non_korean_response(response_text):
+        return False
+    user_text = "\n".join(
+        str(message.get("content") or "")
+        for message in messages
+        if str(message.get("role") or "") == "user"
+    )
+    if not contains_hangul(user_text):
+        return False
+    lowered = user_text.lower()
+    explicit_foreign = ("영어로", "중국어로", "일본어로", "in english", "in chinese", "in japanese")
+    return not any(token in lowered for token in explicit_foreign)
+
+
+def sanitize_korean_response(text: Any) -> str:
+    value = str(text or "").strip()
+    has_chinese_fragment = bool(re.search(r"[\u4e00-\u9fff]", value))
+    if not value or not (starts_with_non_korean_response(value) or has_chinese_fragment) or not contains_hangul(value):
+        return value
+    korean_lines = [line.strip() for line in value.splitlines() if contains_hangul(line)]
+    if not korean_lines:
+        return value
+    cleaned = "\n".join(korean_lines).strip()
+    cleaned = re.sub(r"^한국어로\s*(다시\s*)?(작성하면|말하면|답하면)[,:，]?\s*", "", cleaned)
+    cleaned = re.sub(r"^요약하면[,:，]?\s*", "", cleaned)
+    if re.search(r"[\u4e00-\u9fff]", cleaned):
+        candidates = [
+            candidate.strip().strip("\"'“”.,，。:：")
+            for candidate in re.findall(r"[가-힣A-Za-z0-9\s.,!?·:;()\-\"'“”]+", cleaned)
+            if contains_hangul(candidate)
+        ]
+        if candidates:
+            cleaned = max(candidates, key=len)
+    return cleaned.strip().strip("\"'“”")
 
 
 def conversation_history_for_model(conversation_id: str, limit: int = CONVERSATION_HISTORY_LIMIT) -> list[dict[str, str]]:
@@ -1075,6 +1155,39 @@ def build_analysis_prompt(body: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def build_nms_evidence_digest(context: dict[str, Any]) -> str:
+    if is_network_evidence_pack(context):
+        matched = context.get("matched") or {}
+        coverage = context.get("data_coverage") or {}
+        analysis = context.get("deterministic_analysis") or {}
+        top_signals = analysis.get("top_signals") or []
+        hypotheses = analysis.get("root_cause_hypotheses") or []
+        gaps = analysis.get("gaps") or []
+        lines = [
+            "- 분석 기준: network evidence pack v1. NMS 요약은 참고 자료이며 최종 근거는 고객사별 원천 데이터와 규칙 판정이다.",
+            f"- 매칭 고객/현장: customers={matched.get('customer_count', 0)}, sites={matched.get('site_count', 0)}, site_codes={matched.get('site_codes') or []}",
+            (
+                "- 데이터 커버리지: "
+                f"devices={coverage.get('device_count', 0)}, "
+                f"syslog={coverage.get('syslog_sample_count', 0)}, "
+                f"trap={coverage.get('trap_sample_count', 0)}, "
+                f"interfaces={coverage.get('interface_sample_count', 0)}"
+            ),
+            f"- 상위 이상 신호: {len(top_signals)}건",
+        ]
+        for item in top_signals[:8]:
+            lines.append(
+                f"  · {item.get('severity')} / {item.get('source_type')} / {item.get('signal_type')} / "
+                f"{item.get('site_name') or '-'} / {item.get('device_name') or '-'} / {item.get('evidence') or '-'}"
+            )
+        if hypotheses:
+            lines.append("- 원인 후보 초안:")
+            for item in hypotheses[:5]:
+                lines.append(f"  · {item.get('rank')}. {item.get('cause')} / confidence={item.get('confidence')} / {item.get('basis')}")
+        if gaps:
+            lines.append("- 누락/주의 데이터:")
+            lines.extend([f"  · {item}" for item in gaps[:8]])
+        return "\n".join(lines)
+
     matched = context.get("matched") or {}
     logs = context.get("logs") or {}
     traffic = context.get("traffic") or {}
@@ -1082,6 +1195,7 @@ def build_nms_evidence_digest(context: dict[str, Any]) -> str:
     off_hours = temporal.get("off_hours") or {}
     nas_file_activity = temporal.get("nas_file_activity") or {}
     nas_file_risk = temporal.get("nas_file_risk") or {}
+    nas_ransomware_findings = temporal.get("nas_ransomware_findings") or []
     top_hours = temporal.get("top_event_hours") or []
     lines = [
         f"- 매칭 고객/현장: customers={matched.get('customer_count', 0)}, sites={matched.get('site_count', 0)}, site_codes={matched.get('site_codes') or []}",
@@ -1102,12 +1216,60 @@ def build_nms_evidence_digest(context: dict[str, Any]) -> str:
             f"delete_rename_move_count={nas_file_risk.get('delete_rename_move_count', 0)}, "
             f"suspicious_keyword_count={nas_file_risk.get('suspicious_keyword_count', 0)}"
         ),
+        f"- NAS 랜섬웨어 규칙 경보: {len(nas_ransomware_findings)}건",
         f"- 이벤트 집중 시간대: {top_hours[:8]}",
     ]
     return "\n".join(lines)
 
 
 def build_nms_deterministic_brief(context: dict[str, Any]) -> str:
+    if is_network_evidence_pack(context):
+        requested = context.get("requested") or {}
+        matched = context.get("matched") or {}
+        coverage = context.get("data_coverage") or {}
+        analysis = context.get("deterministic_analysis") or {}
+        signals = analysis.get("top_signals") or []
+        timeline = analysis.get("timeline") or []
+        hypotheses = analysis.get("root_cause_hypotheses") or []
+        next_checks = analysis.get("required_next_checks") or []
+        gaps = analysis.get("gaps") or []
+        lines = [
+            "검증된 고객사별 네트워크 Evidence Pack",
+            f"- 대상: {', '.join(matched.get('customer_names') or []) or requested.get('customer_name') or '전체'} / site_codes={matched.get('site_codes') or []}",
+            f"- 분석 범위: 최근 {requested.get('hours', '-')}시간, from={requested.get('from', '-')}",
+            "- 원칙: NMS 결과는 참고자료이며, 최종 판단은 원천 로그/수치/타임스탬프/규칙 판정에 둔다.",
+            (
+                "- 데이터 커버리지: "
+                f"site={coverage.get('site_count', 0)}, device={coverage.get('device_count', 0)}, "
+                f"syslog={coverage.get('syslog_sample_count', 0)}, trap={coverage.get('trap_sample_count', 0)}, "
+                f"interface={coverage.get('interface_sample_count', 0)}"
+            ),
+        ]
+        if signals:
+            lines.append("- 상위 이상 신호:")
+            for item in signals[:10]:
+                lines.append(
+                    f"  · {item.get('severity')} / {item.get('source_type')} / {item.get('signal_type')} / "
+                    f"{item.get('site_name') or '-'} / {item.get('device_name') or '-'} / {item.get('evidence') or '-'}"
+                )
+        if hypotheses:
+            lines.append("- 원인 후보 초안:")
+            for item in hypotheses[:5]:
+                lines.append(f"  · {item.get('rank')}. {item.get('cause')} / confidence={item.get('confidence')} / {item.get('basis')}")
+        if timeline:
+            lines.append("- 타임라인 샘플:")
+            for item in timeline[:8]:
+                lines.append(
+                    f"  · {item.get('at')} / {item.get('source_type')} / {item.get('device_name') or '-'} / {item.get('message') or '-'}"
+                )
+        if next_checks:
+            lines.append("- 다음 확인 작업:")
+            lines.extend([f"  · {item}" for item in next_checks[:8]])
+        if gaps:
+            lines.append("- 누락/주의 데이터:")
+            lines.extend([f"  · {item}" for item in gaps[:8]])
+        return "\n".join(lines)
+
     requested = context.get("requested") or {}
     matched = context.get("matched") or {}
     logs = context.get("logs") or {}
@@ -1116,6 +1278,7 @@ def build_nms_deterministic_brief(context: dict[str, Any]) -> str:
     off_hours = temporal.get("off_hours") or {}
     nas_file_activity = temporal.get("nas_file_activity") or {}
     nas_file_risk = temporal.get("nas_file_risk") or {}
+    nas_ransomware_findings = temporal.get("nas_ransomware_findings") or []
     recent_off_hours = off_hours.get("recent_events") or []
     top_actors = nas_file_activity.get("top_actors") or []
     top_paths = nas_file_activity.get("top_paths") or []
@@ -1140,6 +1303,7 @@ def build_nms_deterministic_brief(context: dict[str, Any]) -> str:
             f"delete/rename/move={nas_file_risk.get('delete_rename_move_count', 0)}건, "
             f"랜섬웨어 키워드={nas_file_risk.get('suspicious_keyword_count', 0)}건"
         ),
+        f"- NAS 랜섬웨어 규칙 경보: {len(nas_ransomware_findings)}건",
     ]
 
     if int(traffic.get("interface_count") or 0) == 0:
@@ -1165,8 +1329,19 @@ def build_nms_deterministic_brief(context: dict[str, Any]) -> str:
         for item in top_paths[:5]:
             lines.append(f"  · {item.get('path')}: {item.get('count')}건")
 
+    if nas_ransomware_findings:
+        lines.append("- NAS 랜섬웨어 규칙 경보:")
+        for item in nas_ransomware_findings[:5]:
+            lines.append(
+                f"  · {item.get('severity')} / {item.get('title')} / "
+                f"{item.get('device_name') or '-'} / count={item.get('count')} / "
+                f"last={item.get('last_seen_at')} / {item.get('summary') or item.get('sample_message') or '-'}"
+            )
+
     if int(nas_file_risk.get("file_operation_count") or 0) == 0 and int(nas_file_risk.get("suspicious_keyword_count") or 0) == 0:
         lines.append("- 1차 판정: 새벽 시간대 랜섬웨어성 파일작업 직접 징후는 현재 관측되지 않음")
+    if nas_ransomware_findings:
+        lines.append("- 1차 판정: 33번 NMS 규칙 엔진이 랜섬웨어 조기탐지 조건을 충족한 경보를 관측함")
     if int(nas_file_activity.get("file_operation_count") or 0) >= 100:
         lines.append("- 1차 판정: 전체 시간대 파일명 변경이 많으므로 정상 업무/프로그램 임시파일 패턴인지 사용자와 경로 기준으로 확인 필요")
 
@@ -1185,28 +1360,43 @@ def build_nms_analysis_prompt(
     customer_names = ", ".join(matched.get("customer_names") or []) or requested.get("customer_name") or "전체"
     evidence_digest = build_nms_evidence_digest(context)
     data_text = json.dumps(context, ensure_ascii=False, indent=2)[:NMS_ANALYSIS_CONTEXT_CHAR_LIMIT]
-    system_prompt = (
-        "너는 33번 NMS 상시 관제와 ERP 업무 이력을 함께 보는 실무 분석 담당자다. "
-        "NMS 시스로그, SNMP Trap, 장비 상태, 트래픽/프로브/수집기 값, Grafana가 참조하는 "
-        "NMS 원천 데이터를 근거로 장애 징후를 판단한다. 답변은 빠른 추측이 아니라 근거 기반 "
-        "심층 분석이어야 한다. JSON에 없는 내용은 단정하지 말고 '자료 없음' 또는 '추정'으로 "
-        "표시해라. 같은 말을 반복하지 말고, 시간/장비/수치/로그 문구를 근거로 인용해라. "
-        "숫자가 0인 항목은 반드시 '관측되지 않음'으로 해석하고, 없는 데이터를 만들어내지 마라."
-    )
+    if is_network_evidence_pack(context):
+        command_set = context.get("codex_command_set") or {}
+        system_prompt = (
+            "너는 Codex가 지휘하는 고객사별 네트워크 장애 분석 보고 담당자다. "
+            "NMS 결과를 결론으로 추론하지 말고, network evidence pack의 원천 데이터, 규칙 기반 신호, "
+            "타임라인, 누락 데이터, Codex 명령 셋을 근거로만 판단한다. "
+            "확정 사실/추정/누락 데이터/원격 확인/현장 확인/고객 보고 문안을 반드시 분리한다. "
+            "JSON에 없는 내용은 단정하지 말고 '자료 없음'으로 표시한다."
+        )
+        command_prompt = command_set.get("recommended_prompt") or ""
+    else:
+        system_prompt = (
+            "너는 33번 NMS 상시 관제와 ERP 업무 이력을 함께 보는 실무 분석 담당자다. "
+            "NMS 시스로그, SNMP Trap, 장비 상태, 트래픽/프로브/수집기 값, Grafana가 참조하는 "
+            "NMS 원천 데이터를 근거로 장애 징후를 판단한다. 답변은 빠른 추측이 아니라 근거 기반 "
+            "심층 분석이어야 한다. JSON에 없는 내용은 단정하지 말고 '자료 없음' 또는 '추정'으로 "
+            "표시해라. 같은 말을 반복하지 말고, 시간/장비/수치/로그 문구를 근거로 인용해라. "
+            "숫자가 0인 항목은 반드시 '관측되지 않음'으로 해석하고, 없는 데이터를 만들어내지 마라."
+        )
+        command_prompt = ""
     user_prompt = (
         f"분석 대상: {customer_names}\n"
         f"분석 모드: {depth}\n"
         f"요청: {question or '최근 관제 데이터 기준으로 이상 징후와 조치 우선순위를 판단해줘.'}\n\n"
         f"우선 적용할 근거 요약:\n{evidence_digest}\n\n"
+        f"{f'Codex 표준 명령:\\n{command_prompt}\\n\\n' if command_prompt else ''}"
         f"{f'이전 저장 분석 참고:\\n{saved_context}\\n\\n' if saved_context else ''}"
         f"{f'외부 첨부자료 추출본:\\n{attachments_context}\\n\\n' if attachments_context else ''}"
-        f"NMS 컨텍스트 JSON:\n{data_text}\n\n"
+        f"Evidence Pack JSON:\n{data_text}\n\n"
         "분석 지침:\n"
+        "- NMS 요약을 그대로 결론으로 쓰지 말고 고객사별 evidence pack의 원천 근거와 규칙 판정을 먼저 검증한다.\n"
         "- 먼저 전체 JSON을 훑고, matched/sites/devices/traffic/logs/temporal 순서로 근거를 정리한다.\n"
         "- 이전 저장 분석은 참고용이다. 현재 로그/트래픽과 다른 부분이 있으면 차이를 먼저 설명한다.\n"
         "- 첨부자료가 있으면 현재 NMS 원천값과 모순되는지 먼저 비교하고, 첨부자료의 수치/표/문장을 근거에 함께 반영한다.\n"
         "- temporal.off_hours와 temporal.nas_file_risk가 있으면 새벽 이벤트, 랜섬웨어성 파일 작업, 반복 시간대를 별도 판단한다.\n"
         "- temporal.nas_file_activity는 전체 시간대 NAS 파일작업이고, temporal.nas_file_risk는 새벽 시간대 파일작업이다. 둘을 반드시 분리해서 설명해라.\n"
+        "- temporal.nas_ransomware_findings가 있으면 33번 NMS 규칙 엔진의 1차 판정이다. LLM 판단보다 우선 근거로 삼고, severity/title/count/sample_message를 그대로 인용해라.\n"
         "- Grafana 화면은 NMS DB를 시각화한 것이므로, Grafana 값이라고 표현할 때도 JSON의 traffic/logs/temporal 원천값을 근거로 삼는다.\n"
         "- temporal.top_event_hours는 이벤트 발생 시간 분포다. traffic.interfaces가 없으면 트래픽량으로 해석하지 마라.\n"
         "- nas_file_risk.file_operation_count가 0이면 새벽 파일 삭제/이동/이름변경은 관측되지 않았다고 써라. 전체 시간대 파일작업 여부는 nas_file_activity로 따로 판단해라.\n"
@@ -1263,6 +1453,34 @@ def model_summary(model: dict[str, Any]) -> dict[str, Any]:
         "expires_at": model.get("expires_at"),
         "size_vram": model.get("size_vram"),
     }
+
+
+def unload_running_models_except(target_model: str, warnings: list[str] | None = None) -> None:
+    if not MODEL_AUTO_UNLOAD_BEFORE_SWITCH_ENABLED:
+        return
+    target = str(target_model or "").strip()
+    if not target:
+        return
+    status = ollama_status()
+    running = [
+        str(item.get("name") or item.get("model") or "").strip()
+        for item in status.get("running") or []
+        if str(item.get("name") or item.get("model") or "").strip()
+    ]
+    for running_model in running:
+        if running_model == target:
+            continue
+        result = ollama_request(
+            "/api/generate",
+            {"model": running_model, "prompt": "", "stream": False, "keep_alive": 0},
+            timeout=MODEL_SWITCH_UNLOAD_TIMEOUT,
+        )
+        if warnings is not None:
+            if result.get("ok"):
+                warnings.append(f"선택 모델 전환을 위해 기존 실행 모델 {running_model}을 언로드했습니다.")
+            else:
+                error = (result.get("data") or {}).get("error") or "알 수 없는 오류"
+                warnings.append(f"기존 실행 모델 {running_model} 언로드 실패: {error}")
 
 
 class NmsMonitor:
@@ -1614,6 +1832,9 @@ class Handler(BaseHTTPRequestHandler):
                     "auth_required": bool(API_TOKEN),
                     "default_model": DEFAULT_MODEL,
                     "fast_model": FAST_MODEL,
+                    "model_fallback_enabled": MODEL_FALLBACK_ENABLED,
+                    "model_running_switch_guard_enabled": MODEL_RUNNING_SWITCH_GUARD_ENABLED,
+                    "model_auto_unload_before_switch_enabled": MODEL_AUTO_UNLOAD_BEFORE_SWITCH_ENABLED,
                     "ollama_base_url": OLLAMA_BASE_URL,
                     "nms_context_configured": bool(NMS_CONTEXT_BASE_URL and NMS_CONTEXT_TOKEN),
                     "nms_context_base_url": NMS_CONTEXT_BASE_URL,
@@ -1632,6 +1853,9 @@ class Handler(BaseHTTPRequestHandler):
                     "running": [model_summary(m) for m in status["running"]],
                     "default_model": DEFAULT_MODEL,
                     "fast_model": FAST_MODEL,
+                    "model_fallback_enabled": MODEL_FALLBACK_ENABLED,
+                    "model_running_switch_guard_enabled": MODEL_RUNNING_SWITCH_GUARD_ENABLED,
+                    "model_auto_unload_before_switch_enabled": MODEL_AUTO_UNLOAD_BEFORE_SWITCH_ENABLED,
                     "error": status["error"],
                 },
                 HTTPStatus.OK if status["reachable"] else HTTPStatus.BAD_GATEWAY,
@@ -1832,16 +2056,23 @@ class Handler(BaseHTTPRequestHandler):
             )
             return self.json_response(result["data"], HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY)
         if route == "/api/nms/context":
+            params = {
+                "customer_name": first("customer_name"),
+                "site_codes": first("site_codes"),
+                "hours": first("hours", str(NMS_DEEP_ANALYSIS_WINDOW_HOURS)),
+                "limit": first("limit", str(NMS_DEEP_ANALYSIS_LIMIT)),
+            }
             result = nms_get(
-                "/api/integrations/erp/nms-context",
-                {
-                    "customer_name": first("customer_name"),
-                    "site_codes": first("site_codes"),
-                    "hours": first("hours", str(NMS_DEEP_ANALYSIS_WINDOW_HOURS)),
-                    "limit": first("limit", str(NMS_DEEP_ANALYSIS_LIMIT)),
-                },
+                "/api/integrations/erp/network-evidence-pack",
+                params,
                 timeout=max(NMS_CONTEXT_TIMEOUT, 30),
             )
+            if not result["ok"] and int(result.get("status") or 0) in {404, 501}:
+                result = nms_get(
+                    "/api/integrations/erp/nms-context",
+                    params,
+                    timeout=max(NMS_CONTEXT_TIMEOUT, 30),
+                )
             return self.json_response(result["data"], HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY)
         if route == "/api/nms/monitor/status":
             return self.json_response(NMS_MONITOR.snapshot())
@@ -1877,8 +2108,38 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response({"error": f"invalid json: {exc}"}, HTTPStatus.BAD_REQUEST)
             return None
 
+    def resolve_model_for_request(self, requested_model: str) -> tuple[str, list[str]]:
+        model = str(requested_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+        warnings: list[str] = []
+        if not MODEL_FALLBACK_ENABLED or not DEFAULT_MODEL or model == DEFAULT_MODEL:
+            return model, warnings
+
+        status = ollama_status()
+        available = {
+            str(item.get("name") or item.get("model") or "").strip()
+            for item in status.get("models") or []
+            if str(item.get("name") or item.get("model") or "").strip()
+        }
+        running = {
+            str(item.get("name") or item.get("model") or "").strip()
+            for item in status.get("running") or []
+            if str(item.get("name") or item.get("model") or "").strip()
+        }
+        if DEFAULT_MODEL not in available:
+            return model, warnings
+        if model not in available:
+            warnings.append(f"요청 모델 {model}이 설치되어 있지 않아 운영 기본 모델 {DEFAULT_MODEL}로 실행했습니다.")
+            return DEFAULT_MODEL, warnings
+        if MODEL_RUNNING_SWITCH_GUARD_ENABLED and DEFAULT_MODEL in running and model not in running:
+            warnings.append(
+                f"현재 GPU에는 {DEFAULT_MODEL}가 실행 중입니다. 모델 전환 timeout을 피하기 위해 {model} 대신 운영 기본 모델로 실행했습니다."
+            )
+            return DEFAULT_MODEL, warnings
+        return model, warnings
+
     def run_chat_completion(self, body: dict[str, Any]) -> tuple[dict[str, Any], HTTPStatus]:
-        model = str(body.get("model") or DEFAULT_MODEL)
+        requested_model = str(body.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+        model, warnings = self.resolve_model_for_request(requested_model)
         messages = body.get("messages")
         if not messages:
             prompt = str(body.get("prompt") or "")
@@ -1926,10 +2187,49 @@ class Handler(BaseHTTPRequestHandler):
         }
         if options:
             payload["options"] = options
+        unload_running_models_except(model, warnings)
         started = time.monotonic()
         result = ollama_request("/api/chat", payload, timeout=int(body.get("timeout") or REQUEST_TIMEOUT))
         elapsed_ms = int((time.monotonic() - started) * 1000)
         response_text = (result["data"].get("message") or {}).get("content")
+        if not result["ok"] and MODEL_FALLBACK_ENABLED and model != DEFAULT_MODEL and DEFAULT_MODEL:
+            error_text = str((result.get("data") or {}).get("error") or "")
+            if "timed out" in error_text.lower():
+                warnings.append(f"{model} 응답이 timeout되어 {DEFAULT_MODEL}로 한 번 더 실행했습니다.")
+                model = DEFAULT_MODEL
+                payload["model"] = model
+                started = time.monotonic()
+                result = ollama_request("/api/chat", payload, timeout=int(body.get("timeout") or REQUEST_TIMEOUT))
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                response_text = (result["data"].get("message") or {}).get("content")
+        if result["ok"] and should_retry_korean_response(messages, response_text):
+            warnings.append("응답이 한국어가 아닌 언어로 시작되어 한국어 재작성 요청을 자동 실행했습니다.")
+            retry_payload = dict(payload)
+            retry_payload["messages"] = [
+                {
+                    "role": "system",
+                    "content": (
+                        "방금 응답은 한국어가 아닌 언어로 시작했다. 최종 답변은 반드시 한국어만 사용한다. "
+                        "중국어/영어 표현 없이 자연스러운 한국어로 다시 작성한다."
+                    ),
+                },
+                *messages,
+                {"role": "user", "content": "위 요청에 대한 최종 답변을 한국어로만 다시 작성해라."},
+            ]
+            started = time.monotonic()
+            retry_result = ollama_request("/api/chat", retry_payload, timeout=int(body.get("timeout") or REQUEST_TIMEOUT))
+            retry_elapsed_ms = int((time.monotonic() - started) * 1000)
+            retry_response = (retry_result.get("data") or {}).get("message", {}).get("content")
+            if retry_result.get("ok") and retry_response:
+                result = retry_result
+                elapsed_ms += retry_elapsed_ms
+                response_text = retry_response
+        sanitized_response = sanitize_korean_response(response_text)
+        if sanitized_response != (response_text or ""):
+            warnings.append("최종 응답 앞부분의 비한국어 문장을 제거하고 한국어 답변만 표시했습니다.")
+            response_text = sanitized_response
+            if isinstance(result.get("data", {}).get("message"), dict):
+                result["data"]["message"]["content"] = response_text
         prepend_report = str(body.get("prepend_report") or "").strip()
         if prepend_report and response_text:
             response_text = f"{prepend_report}\n\n---\n\nLLM 심층 분석\n{response_text}"
@@ -1957,6 +2257,8 @@ class Handler(BaseHTTPRequestHandler):
         response_body = {
             "ok": result["ok"],
             "model": model,
+            "model_requested": requested_model,
+            "warnings": warnings,
             "elapsed_ms": elapsed_ms,
             "conversation_id": conversation_id or None,
             "message": result["data"].get("message"),
@@ -2021,16 +2323,23 @@ class Handler(BaseHTTPRequestHandler):
         default_hours = NMS_DEEP_ANALYSIS_WINDOW_HOURS if depth in {"deep", "심층", "detailed"} else NMS_MONITOR_WINDOW_HOURS
         default_limit = NMS_DEEP_ANALYSIS_LIMIT if depth in {"deep", "심층", "detailed"} else 20
 
+        context_params = {
+            "customer_name": customer_name,
+            "site_codes": site_codes,
+            "hours": body.get("hours") or default_hours,
+            "limit": body.get("limit") or default_limit,
+        }
         result = nms_get(
-            "/api/integrations/erp/nms-context",
-            {
-                "customer_name": customer_name,
-                "site_codes": site_codes,
-                "hours": body.get("hours") or default_hours,
-                "limit": body.get("limit") or default_limit,
-            },
+            "/api/integrations/erp/network-evidence-pack",
+            context_params,
             timeout=max(NMS_CONTEXT_TIMEOUT, 30),
         )
+        if not result["ok"] and int(result.get("status") or 0) in {404, 501}:
+            result = nms_get(
+                "/api/integrations/erp/nms-context",
+                context_params,
+                timeout=max(NMS_CONTEXT_TIMEOUT, 30),
+            )
         if not result["ok"]:
             return self.json_response(result["data"], HTTPStatus.BAD_GATEWAY)
 
@@ -2073,6 +2382,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_model_lifecycle(self, body: dict[str, Any], keep_alive: str | int) -> None:
         model = str(body.get("model") or DEFAULT_MODEL)
+        warnings: list[str] = []
+        if keep_alive != 0 and str(keep_alive) != "0":
+            unload_running_models_except(model, warnings)
         result = ollama_request(
             "/api/generate",
             {"model": model, "prompt": "", "stream": False, "keep_alive": keep_alive},
@@ -2083,6 +2395,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": result["ok"],
                 "model": model,
                 "keep_alive": keep_alive,
+                "warnings": warnings,
                 "ollama": result["data"],
                 "running": ollama_status().get("running"),
                 "gpu": gpu_status(),
@@ -2101,6 +2414,9 @@ class Handler(BaseHTTPRequestHandler):
                 "auth_required": bool(API_TOKEN),
                 "default_model": DEFAULT_MODEL,
                 "fast_model": FAST_MODEL,
+                "model_fallback_enabled": MODEL_FALLBACK_ENABLED,
+                "model_running_switch_guard_enabled": MODEL_RUNNING_SWITCH_GUARD_ENABLED,
+                "model_auto_unload_before_switch_enabled": MODEL_AUTO_UNLOAD_BEFORE_SWITCH_ENABLED,
             },
             "nms_monitor": NMS_MONITOR.snapshot(),
             "nms_autopilot": NMS_AUTOPILOT.snapshot(),
@@ -2215,6 +2531,19 @@ INDEX_HTML = r"""<!doctype html>
       cursor: pointer;
     }
     button.secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); }
+    details.advanced {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 10px 12px;
+      background: rgba(255, 255, 255, 0.04);
+    }
+    details.advanced summary {
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    details.advanced .row { margin-top: 10px; }
     .metric {
       display: grid;
       grid-template-columns: 1fr auto;
@@ -2258,7 +2587,7 @@ INDEX_HTML = r"""<!doctype html>
   <header>
     <div>
       <h1>Metro LLM Ops</h1>
-      <div class="subtitle">118 GPU 서버 로컬 LLM 운영 콘솔</div>
+      <div class="subtitle">흐름: 모델 선택 → 업체/현장 선택 → 분석 기능 선택 → 분석 실행 → 이어 묻기/결과 저장</div>
     </div>
     <div id="statusPill" class="pill warn">상태 확인 중</div>
   </header>
@@ -2278,26 +2607,34 @@ INDEX_HTML = r"""<!doctype html>
         <div class="grid2">
           <div>
             <label>모델</label>
-            <select id="model"></select>
+            <select id="model" onchange="rememberSelectedModel()"></select>
           </div>
           <div>
-            <label>분석 템플릿</label>
+            <label>분석 기능</label>
             <select id="template">
-              <option value="freeform">일반 분석</option>
-              <option value="nms_events">NMS/장애 로그</option>
+              <option value="nms_deep">업체 NMS 심층분석</option>
+              <option value="nms_context">선택 데이터 보기</option>
               <option value="maintenance_report">유지보수 보고서</option>
               <option value="customer_history">고객사 이력 요약</option>
+              <option value="freeform">본문/첨부 일반분석</option>
+              <option value="codex_task">Codex 작업 지시 초안</option>
             </select>
           </div>
         </div>
         <div class="row">
           <button onclick="saveToken()">토큰 저장</button>
           <button class="secondary" onclick="newConversation()">새 대화</button>
-          <button class="secondary" onclick="loadConversations()">대화 새로고침</button>
-          <button class="secondary" onclick="preload()">프리로드</button>
-          <button class="secondary" onclick="unload()">언로드</button>
-          <button class="secondary" onclick="benchmark()">벤치마크</button>
+          <button class="secondary" onclick="refreshAll()">상태/목록 새로고침</button>
         </div>
+        <details class="advanced">
+          <summary>고급 모델 작업</summary>
+          <div class="row">
+            <button class="secondary" onclick="loadConversations()">대화 새로고침</button>
+            <button class="secondary" onclick="preload()">프리로드</button>
+            <button class="secondary" onclick="unload()">언로드</button>
+            <button class="secondary" onclick="benchmark()">벤치마크</button>
+          </div>
+        </details>
       </div>
       <div class="card stack" id="metrics"></div>
       <div class="card stack">
@@ -2320,10 +2657,8 @@ INDEX_HTML = r"""<!doctype html>
           </div>
         </div>
         <div class="row">
-          <button class="secondary" onclick="loadNmsCustomers()">업체 새로고침</button>
-          <button class="secondary" onclick="loadNmsContext()">NMS 불러오기</button>
-          <button class="secondary" onclick="analyzeNms()">NMS 분석</button>
-          <button class="secondary" onclick="toggleNmsMonitor()">상시 시작/중지</button>
+          <button class="secondary" onclick="loadNmsCustomers()">업체/상태 새로고침</button>
+          <button class="secondary" onclick="toggleNmsMonitor()">상태카드 자동갱신</button>
         </div>
         <div id="nmsMonitorSummary" class="metric">
           <span>모니터링 상태</span><b>확인 전</b>
@@ -2365,13 +2700,13 @@ INDEX_HTML = r"""<!doctype html>
             <input id="customer" placeholder="예: (주)농업회사법인돈우" onchange="loadSavedAnalyses(true)" />
           </div>
           <div>
-            <label>요청</label>
-            <input id="question" placeholder="예: 최근 24시간 장애 가능성을 판단해줘" />
+            <label>요청 / 후속 질문</label>
+            <input id="question" placeholder="예: 최근 24시간 장애 가능성을 판단해줘. 이후에는 여기에 이어서 질문합니다." />
           </div>
         </div>
         <div>
-          <label>프롬프트 / 로그 / JSON 데이터</label>
-          <textarea id="prompt" placeholder="여기에 NMS 이벤트, 작업일지, 로그, 질문을 넣습니다."></textarea>
+          <label>추가 자료 / 로그 / 메모</label>
+          <textarea id="prompt" placeholder="필요할 때만 NMS 이벤트, 작업일지, 로그, 첨부 설명을 넣습니다. 업체 NMS 분석은 비워도 됩니다."></textarea>
         </div>
         <div class="grid2">
           <div>
@@ -2383,10 +2718,11 @@ INDEX_HTML = r"""<!doctype html>
           </div>
         </div>
         <div class="row">
-          <button onclick="analyze()">분석 실행</button>
-          <button class="secondary" onclick="chat()">일반 채팅</button>
+          <button onclick="runSelectedAnalysis()">분석 실행</button>
+          <button class="secondary" onclick="continueConversation()">이어 묻기</button>
+          <button class="secondary" onclick="saveCurrentAnalysis()">결과 저장</button>
+          <button class="secondary" onclick="buildCodexTaskDraft()">Codex 지시 초안</button>
           <button class="secondary" onclick="clearAttachments()">첨부 비우기</button>
-          <button class="secondary" onclick="refresh()">상태 새로고침</button>
         </div>
       </div>
       <div class="card result"><pre id="result">대기 중입니다.</pre></div>
@@ -2502,17 +2838,45 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function renderResponseWithAttachmentWarnings(data) {
-      let text = data.response || JSON.stringify(data, null, 2);
+      let text = data.response || "";
+      if (!text && data.ok === false) {
+        const rawError = data.raw?.error || data.error || "알 수 없는 오류";
+        text = `LLM 응답 실패: ${rawError}`;
+      }
+      if (!text) text = JSON.stringify(data, null, 2);
+      if (data.model || data.model_requested) {
+        const requested = data.model_requested || data.model || "운영 기본 모델";
+        const used = data.model || "알 수 없음";
+        text = `[모델]\n- 요청: ${requested}\n- 실행: ${used}\n\n${text}`;
+      }
+      if (Array.isArray(data.warnings) && data.warnings.length) {
+        text = `[실행 보정]\n- ${data.warnings.join("\n- ")}\n\n${text}`;
+      }
       if (Array.isArray(data.attachment_errors) && data.attachment_errors.length) {
         text += `\n\n[첨부 처리 경고]\n- ${data.attachment_errors.join("\n- ")}`;
       }
       return text;
     }
 
+    function describeApiError(data, res) {
+      if (!data) return `HTTP ${res.status} ${res.statusText}`;
+      if (typeof data.error === "string") return data.error;
+      if (data.error?.message) return data.error.message;
+      if (data.raw?.error) return data.raw.error;
+      if (data.response) return data.response;
+      return `HTTP ${res.status} ${JSON.stringify(data)}`;
+    }
+
     async function api(path, options = {}) {
       const res = await fetch(path, options);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || JSON.stringify(data));
+      const text = await res.text();
+      let data = {};
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch (err) {
+        data = {error: text || String(err)};
+      }
+      if (!res.ok) throw new Error(describeApiError(data, res));
       return data;
     }
 
@@ -2762,6 +3126,11 @@ INDEX_HTML = r"""<!doctype html>
       renderHealthMetrics(health);
     }
 
+    function rememberSelectedModel() {
+      const model = $("model").value;
+      if (model) localStorage.setItem("llmOpsSelectedModel", model);
+    }
+
     function startHealthAutoRefresh() {
       if (healthTimer) clearInterval(healthTimer);
       healthTimer = setInterval(() => {
@@ -2773,22 +3142,40 @@ INDEX_HTML = r"""<!doctype html>
 
     async function refresh() {
       try {
+        const currentModel = $("model").value || localStorage.getItem("llmOpsSelectedModel") || "";
         const health = await api("/api/health");
         const models = await api("/api/models");
         $("model").innerHTML = "";
+        const modelNames = (models.models || []).map((m) => m.name).filter(Boolean);
+        const selectedModel = currentModel && modelNames.includes(currentModel) ? currentModel : models.default_model;
         for (const m of models.models || []) {
           const opt = document.createElement("option");
           opt.value = m.name;
-          opt.textContent = m.name;
-          if (m.name === models.default_model) opt.selected = true;
+          if (m.name === models.default_model) {
+            opt.textContent = `운영 기본 · ${m.name}`;
+          } else if (m.name === models.fast_model) {
+            opt.textContent = `빠른 응답 · ${m.name}`;
+          } else {
+            opt.textContent = `고급 모델 · ${m.name}`;
+          }
+          if (m.name === selectedModel) opt.selected = true;
           $("model").appendChild(opt);
         }
+        if (selectedModel) localStorage.setItem("llmOpsSelectedModel", selectedModel);
         renderHealthMetrics(health, models.running || []);
       } catch (err) {
         $("statusPill").className = "pill bad";
         $("statusPill").textContent = "상태 확인 실패";
         setResult(String(err));
       }
+    }
+
+    async function refreshAll() {
+      await refresh();
+      await loadConversations();
+      await refreshNmsMonitor();
+      await loadNmsCustomers();
+      await loadSavedAnalyses(true);
     }
 
     function renderNmsMonitor(state) {
@@ -2870,6 +3257,9 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       $("customer").value = customer.customer_name;
+      if ($("template").value === "freeform") {
+        $("template").value = "nms_deep";
+      }
       for (const site of customer.sites || []) {
         const opt = document.createElement("option");
         opt.value = site.site_code;
@@ -2892,7 +3282,7 @@ INDEX_HTML = r"""<!doctype html>
         setResult("업체 또는 현장을 먼저 선택하세요.");
         return;
       }
-      $("template").value = "nms_events";
+      $("template").value = "nms_context";
       $("question").value ||= "최근 48시간 기준으로 새벽 이벤트, 장애 징후, 보안 위험, 조치 우선순위를 근거 중심으로 판단해줘.";
       const query = new URLSearchParams({
         customer_name: customer?.customer_name || "",
@@ -2919,7 +3309,7 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       try {
-        setResult("33 NMS 데이터 분석 중...");
+        setResult(`33 NMS 데이터 분석 중... 선택 모델(${ $("model").value || "운영 기본 모델" })로 심층 분석합니다.`);
         const attachments = await collectAttachmentPayloads();
         const data = await api("/api/nms/analyze", {
           method: "POST",
@@ -2949,17 +3339,72 @@ INDEX_HTML = r"""<!doctype html>
       if (nmsMonitorTimer) {
         clearInterval(nmsMonitorTimer);
         nmsMonitorTimer = null;
-        $("nmsMonitorPill").textContent = "상시 중지";
+        $("nmsMonitorPill").textContent = "상태카드 자동갱신 중지";
         return;
       }
       refreshNmsMonitor();
       nmsMonitorTimer = setInterval(refreshNmsMonitor, 60000);
-      $("nmsMonitorPill").textContent = "상시 실행";
+      $("nmsMonitorPill").textContent = "상태카드 자동갱신";
+    }
+
+    function backendTemplate(mode) {
+      if (mode === "maintenance_report") return "maintenance_report";
+      if (mode === "customer_history") return "customer_history";
+      return "freeform";
+    }
+
+    async function runSelectedAnalysis() {
+      const mode = $("template").value;
+      if (mode === "nms_deep") return analyzeNms();
+      if (mode === "nms_context") return loadNmsContext();
+      if (mode === "codex_task") return buildCodexTaskDraft();
+      return analyze();
+    }
+
+    function currentResultText() {
+      const value = $("result").textContent.trim();
+      if (!value || value === "대기 중입니다." || value.startsWith("생성 중") || value.startsWith("분석 중")) {
+        return "";
+      }
+      return value;
+    }
+
+    function buildCodexTaskDraft() {
+      const scope = analysisScope();
+      const customer = scope.customer_name || "고객사 미지정";
+      const site = scope.site_name || scope.site_code || "전체 현장";
+      const question = $("question").value.trim() || "현재 선택된 고객/현장 데이터를 기준으로 원인 분석과 개선 작업을 진행해줘.";
+      const result = currentResultText();
+      const prompt = $("prompt").value.trim();
+      const draft = [
+        "Codex 작업 지시 초안",
+        "",
+        "목표:",
+        `- ${question}`,
+        "",
+        "대상:",
+        `- 고객사: ${customer}`,
+        `- 현장: ${site}`,
+        `- 모델: ${$("model").value || "운영 기본 모델"}`,
+        "",
+        "참고 자료:",
+        result ? result.slice(0, 5000) : "- 현재 저장된 분석 결과 없음",
+        prompt ? `\n추가 메모/로그:\n${prompt.slice(0, 3000)}` : "",
+        "",
+        "Codex에게 요청할 작업:",
+        "- 제공된 근거를 먼저 요약한다.",
+        "- 확정 사실과 추정 판단을 분리한다.",
+        "- 필요한 코드/설정/운영 변경이 있으면 파일, 서비스, 검증 명령까지 제시한다.",
+        "- 실행 전 위험 요소와 되돌리는 방법을 같이 남긴다.",
+      ].filter(Boolean).join("\n");
+      $("savedAnalysisTitle").value ||= `${customer} Codex 작업 지시`;
+      setResult(draft);
+      return draft;
     }
 
     async function chat() {
       try {
-        setResult("생성 중...");
+        setResult(`생성 중... 선택 모델(${ $("model").value || "운영 기본 모델" })로 실행합니다.`);
         const attachments = await collectAttachmentPayloads();
         const data = await api("/api/chat", {
           method: "POST",
@@ -2981,16 +3426,51 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    async function continueConversation() {
+      try {
+        const question = $("question").value.trim();
+        const extra = $("prompt").value.trim();
+        if (!question && !extra) {
+          setResult("이어 묻기 내용을 '요청 / 후속 질문' 또는 '추가 자료'에 입력하세요.");
+          return;
+        }
+        setResult("이전 분석 맥락을 이어서 답변 생성 중...");
+        const attachments = await collectAttachmentPayloads();
+        const prompt = [
+          "이전 분석과 대화 이력을 이어서 답해라.",
+          question ? `후속 질문:\n${question}` : "",
+          extra ? `추가 자료:\n${extra}` : "",
+        ].filter(Boolean).join("\n\n");
+        const data = await api("/api/chat", {
+          method: "POST",
+          headers: headers(),
+          body: JSON.stringify(conversationPayload({
+            model: $("model").value,
+            prompt,
+            attachments,
+            temperature: 0.16,
+            source: "follow-up",
+          })),
+        });
+        applyConversationFromResponse(data);
+        setResult(renderResponseWithAttachmentWarnings(data));
+        $("savedAnalysisTitle").value ||= $("question").value.trim() || `${$("customer").value.trim() || "고객"} 후속 질의`;
+        refresh();
+      } catch (err) {
+        setResult(String(err));
+      }
+    }
+
     async function analyze() {
       try {
-        setResult("분석 중...");
+        setResult(`분석 중... 선택 모델(${ $("model").value || "운영 기본 모델" })로 실행합니다.`);
         const attachments = await collectAttachmentPayloads();
         const data = await api("/api/analyze", {
           method: "POST",
           headers: headers(),
           body: JSON.stringify(conversationPayload({
             model: $("model").value,
-            template: $("template").value,
+            template: backendTemplate($("template").value),
             customer: $("customer").value,
             question: $("question").value,
             data: $("prompt").value,
@@ -3048,7 +3528,6 @@ INDEX_HTML = r"""<!doctype html>
     loadNmsCustomers();
     loadSavedAnalyses(true);
     renderAttachmentSummary();
-    toggleNmsMonitor();
   </script>
 </body>
 </html>
