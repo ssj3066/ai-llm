@@ -95,6 +95,9 @@ NMS_MONITOR_LIMIT = int(os.getenv("NMS_MONITOR_LIMIT", "500"))
 NMS_DEEP_ANALYSIS_WINDOW_HOURS = int(os.getenv("NMS_DEEP_ANALYSIS_WINDOW_HOURS", "48"))
 NMS_DEEP_ANALYSIS_LIMIT = int(os.getenv("NMS_DEEP_ANALYSIS_LIMIT", "80"))
 NMS_ANALYSIS_CONTEXT_CHAR_LIMIT = int(os.getenv("NMS_ANALYSIS_CONTEXT_CHAR_LIMIT", "90000"))
+NMS_LLM_EVIDENCE_CHAR_LIMIT = int(os.getenv("NMS_LLM_EVIDENCE_CHAR_LIMIT", "25000"))
+LLM_OPS_MAX_PROMPT_CHARS = int(os.getenv("LLM_OPS_MAX_PROMPT_CHARS", "50000"))
+LLM_OPS_MAX_SINGLE_MESSAGE_CHARS = int(os.getenv("LLM_OPS_MAX_SINGLE_MESSAGE_CHARS", "30000"))
 NMS_ANALYSIS_TIMEOUT = int(os.getenv("NMS_ANALYSIS_TIMEOUT_SECONDS", "900"))
 NMS_ANALYSIS_NUM_CTX = int(os.getenv("NMS_ANALYSIS_NUM_CTX", "16384"))
 NMS_ANALYSIS_NUM_PREDICT = int(os.getenv("NMS_ANALYSIS_NUM_PREDICT", "3072"))
@@ -142,6 +145,18 @@ def clip_text(value: Any, limit: int = CONVERSATION_MESSAGE_CHAR_LIMIT) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit].rstrip()}\n\n...[truncated {len(text) - limit} chars]"
+
+
+def clip_middle_text(value: Any, limit: int = CONVERSATION_MESSAGE_CHAR_LIMIT) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    if limit <= 200:
+        return clip_text(text, limit)
+    head = max(80, int(limit * 0.62))
+    tail = max(80, limit - head - 80)
+    omitted = len(text) - head - tail
+    return f"{text[:head].rstrip()}\n\n...[middle truncated {omitted} chars]...\n\n{text[-tail:].lstrip()}"
 
 
 def sanitize_attachment_name(value: Any) -> str:
@@ -570,6 +585,77 @@ def list_conversations(limit: int = 50) -> list[dict[str, Any]]:
         return items
 
 
+def list_autopilot_history(limit: int = 20) -> list[dict[str, Any]]:
+    init_conversation_store()
+    safe_limit = max(1, min(int(limit or 20), 100))
+    with CONVERSATION_LOCK, sqlite3.connect(CONVERSATION_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT c.*,
+                   (SELECT COUNT(*) FROM conversation_messages m WHERE m.conversation_id = c.id) AS message_count,
+                   (SELECT content FROM conversation_messages m
+                    WHERE m.conversation_id = c.id AND m.role = 'assistant'
+                    ORDER BY m.id DESC LIMIT 1) AS latest_assistant,
+                   (SELECT created_at FROM conversation_messages m
+                    WHERE m.conversation_id = c.id AND m.role = 'assistant'
+                    ORDER BY m.id DESC LIMIT 1) AS latest_assistant_at,
+                   (SELECT content FROM conversation_messages m
+                    WHERE m.conversation_id = c.id AND m.role = 'user'
+                    ORDER BY m.id DESC LIMIT 1) AS latest_user
+            FROM conversations c
+            WHERE c.id LIKE ?
+               OR c.meta_json LIKE ?
+               OR c.meta_json LIKE ?
+            ORDER BY c.updated_at DESC
+            LIMIT ?
+            """,
+            (
+                f"{NMS_AUTOPILOT_CONVERSATION_PREFIX}-%",
+                '%"source": "nms-autopilot"%',
+                '%"source":"nms-autopilot"%',
+                safe_limit,
+            ),
+        ).fetchall()
+        items = []
+        for row in rows:
+            item = serialize_conversation_row(row)
+            meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+            target = meta.get("target") if isinstance(meta.get("target"), dict) else {}
+            item["target"] = target
+            item["message_count"] = int(row["message_count"] or 0)
+            item["latest_user"] = clip_text(row["latest_user"] or "", 500)
+            item["latest_assistant_preview"] = clip_text(row["latest_assistant"] or "", 1200)
+            item["latest_assistant_at"] = row["latest_assistant_at"] or ""
+            items.append(item)
+        return items
+
+
+def conversation_store_counts() -> dict[str, int]:
+    init_conversation_store()
+    with CONVERSATION_LOCK, sqlite3.connect(CONVERSATION_DB_PATH) as conn:
+        conversation_count = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+        message_count = conn.execute("SELECT COUNT(*) FROM conversation_messages").fetchone()[0]
+        saved_count = conn.execute("SELECT COUNT(*) FROM saved_analyses").fetchone()[0]
+    return {
+        "conversations": int(conversation_count or 0),
+        "messages": int(message_count or 0),
+        "saved_analyses": int(saved_count or 0),
+    }
+
+
+def operations_dashboard_payload() -> dict[str, Any]:
+    return {
+        "success": True,
+        "generated_at": utc_now(),
+        "conversation_store": conversation_store_counts(),
+        "monitor": NMS_MONITOR.snapshot(),
+        "autopilot": NMS_AUTOPILOT.snapshot(),
+        "autopilot_history": list_autopilot_history(limit=20),
+        "saved_analyses": list_saved_analyses(limit=20, include_content=False),
+    }
+
+
 def load_conversation(conversation_id: str, limit: int = 100) -> dict[str, Any] | None:
     init_conversation_store()
     normalized_id = normalize_conversation_id(conversation_id)
@@ -858,6 +944,173 @@ def build_saved_analysis_context(customer_name: str, site_code: Any = "", limit:
 
 def is_network_evidence_pack(context: dict[str, Any]) -> bool:
     return str((context or {}).get("evidence_pack_version") or "").startswith("network-evidence-pack")
+
+
+def limited_list(value: Any, limit: int) -> list[Any]:
+    if not isinstance(value, list):
+        return []
+    return value[: max(0, limit)]
+
+
+def compact_evidence_views(value: Any, row_limit: int = 20) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    compact: dict[str, Any] = {}
+    for name, payload in value.items():
+        if isinstance(payload, dict):
+            next_payload = dict(payload)
+            if isinstance(next_payload.get("rows"), list):
+                next_payload["rows"] = limited_list(next_payload.get("rows"), row_limit)
+            compact[str(name)] = next_payload
+        elif isinstance(payload, list):
+            compact[str(name)] = limited_list(payload, row_limit)
+        else:
+            compact[str(name)] = payload
+    return compact
+
+
+def compact_compressed_evidence(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    compact = dict(value)
+    aggregates = value.get("aggregates") if isinstance(value.get("aggregates"), dict) else {}
+    samples = value.get("representative_samples") if isinstance(value.get("representative_samples"), dict) else {}
+    compact["aggregates"] = {
+        "syslog_by_hour": limited_list(aggregates.get("syslog_by_hour"), 48),
+        "syslog_top_devices": limited_list(aggregates.get("syslog_top_devices"), 20),
+        "syslog_top_apps": limited_list(aggregates.get("syslog_top_apps"), 20),
+        "trap_top_oids": limited_list(aggregates.get("trap_top_oids"), 20),
+        "trap_top_sources": limited_list(aggregates.get("trap_top_sources"), 20),
+        "polling_top_metrics": limited_list(aggregates.get("polling_top_metrics"), 25),
+        "interface_latest_by_device": limited_list(aggregates.get("interface_latest_by_device"), 25),
+    }
+    compact["representative_samples"] = {
+        "syslog_patterns": limited_list(samples.get("syslog_patterns"), 25),
+        "syslog_dhcp_patterns": limited_list(samples.get("syslog_dhcp_patterns"), 25),
+        "syslog_stp_patterns": limited_list(samples.get("syslog_stp_patterns"), 25),
+        "polling_latest_by_device": limited_list(samples.get("polling_latest_by_device"), 25),
+    }
+    return compact
+
+
+def compact_network_evidence_for_llm(context: dict[str, Any]) -> dict[str, Any]:
+    analysis = context.get("deterministic_analysis") or {}
+    raw = context.get("raw_evidence") or {}
+    logs = raw.get("logs") or {}
+    traffic = raw.get("traffic") or {}
+    temporal = raw.get("temporal") or {}
+    compressed = compact_compressed_evidence(context.get("compressed_evidence") or {})
+    compact_analysis = {
+        "data_policy": analysis.get("data_policy") or context.get("source_policy") or {},
+        "coverage": analysis.get("coverage") or context.get("data_coverage") or {},
+        "top_signals": limited_list(analysis.get("top_signals"), 40),
+        "protocol_analysis": analysis.get("protocol_analysis") or {},
+        "timeline": limited_list(analysis.get("timeline"), 80),
+        "gaps": limited_list(analysis.get("gaps"), 30),
+        "root_cause_hypotheses": limited_list(analysis.get("root_cause_hypotheses"), 12),
+        "required_next_checks": limited_list(analysis.get("required_next_checks"), 30),
+    }
+    raw_samples = {
+        "sites": limited_list(raw.get("sites"), 20),
+        "devices": limited_list(raw.get("devices"), 80),
+        "traffic": {
+            "interface_count": traffic.get("interface_count", 0),
+            "interfaces": limited_list(traffic.get("interfaces"), 30),
+        },
+        "logs": {
+            "syslog_count": logs.get("syslog_count", 0),
+            "trap_count": logs.get("trap_count", 0),
+            "syslog": limited_list(logs.get("syslog"), 30),
+            "traps": limited_list(logs.get("traps"), 20),
+        },
+        "temporal": temporal,
+        "views": compact_evidence_views(raw.get("views") or {}, row_limit=15),
+    }
+    return {
+        "generated_at": context.get("generated_at"),
+        "evidence_pack_version": context.get("evidence_pack_version"),
+        "requested": context.get("requested") or {},
+        "matched": context.get("matched") or {},
+        "source_policy": context.get("source_policy") or {},
+        "data_coverage": context.get("data_coverage") or {},
+        "compressed_evidence": compressed,
+        "deterministic_analysis": compact_analysis,
+        "raw_evidence_policy": context.get("raw_evidence_policy") or {
+            "role": "sample_only",
+            "note": "raw_evidence는 제한 샘플이다. 기간 전체 판단은 compressed_evidence와 deterministic_analysis를 우선한다.",
+        },
+        "raw_evidence_samples": raw_samples,
+        "codex_command_set": context.get("codex_command_set") or {},
+        "llm_payload_policy": {
+            "rule": "33번 NMS가 기간 전체 원천 데이터를 SQL로 먼저 집계/압축했고, 118번 LLM은 이 압축 evidence와 대표 샘플을 분석한다.",
+            "do_not_do": [
+                "원문 전체가 없다는 이유로 없는 값을 상상하지 않는다.",
+                "raw_evidence_samples의 샘플 건수를 기간 전체 건수로 오해하지 않는다.",
+                "compressed_evidence.source_totals가 0이면 해당 소스는 관측되지 않음으로 표시한다.",
+            ],
+        },
+    }
+
+
+def compact_nms_context_for_llm(context: dict[str, Any]) -> dict[str, Any]:
+    if is_network_evidence_pack(context):
+        return compact_network_evidence_for_llm(context)
+    raw_logs = context.get("logs") or {}
+    raw_traffic = context.get("traffic") or {}
+    return {
+        "generated_at": context.get("generated_at"),
+        "requested": context.get("requested") or {},
+        "matched": context.get("matched") or {},
+        "sites": limited_list(context.get("sites"), 20),
+        "devices": limited_list(context.get("devices"), 80),
+        "traffic": {
+            "interface_count": raw_traffic.get("interface_count", 0),
+            "interfaces": limited_list(raw_traffic.get("interfaces"), 30),
+        },
+        "logs": {
+            "syslog_count": raw_logs.get("syslog_count", 0),
+            "trap_count": raw_logs.get("trap_count", 0),
+            "syslog": limited_list(raw_logs.get("syslog"), 30),
+            "traps": limited_list(raw_logs.get("traps"), 20),
+        },
+        "temporal": context.get("temporal") or {},
+        "llm_payload_policy": {
+            "rule": "NMS 원천 데이터 중 LLM에 필요한 샘플만 포함한다. 전체 건수는 count 필드를 우선한다.",
+        },
+    }
+
+
+def compact_messages_for_prompt_budget(messages: list[dict[str, str]], warnings: list[str]) -> list[dict[str, str]]:
+    total_chars = sum(len(str(message.get("content") or "")) for message in messages)
+    if total_chars <= LLM_OPS_MAX_PROMPT_CHARS:
+        return messages
+
+    compacted: list[dict[str, str]] = []
+    remaining = max(4000, LLM_OPS_MAX_PROMPT_CHARS)
+    for index, message in enumerate(messages):
+        role = str(message.get("role") or "user")
+        content = str(message.get("content") or "")
+        if not content:
+            continue
+        if role == "system":
+            limit = min(len(content), 12000, remaining)
+        elif index == len(messages) - 1:
+            limit = min(max(8000, int(remaining * 0.7)), LLM_OPS_MAX_SINGLE_MESSAGE_CHARS)
+        else:
+            limit = min(max(2500, int(remaining * 0.25)), LLM_OPS_MAX_SINGLE_MESSAGE_CHARS)
+        clipped = clip_middle_text(content, max(800, limit))
+        compacted.append({"role": role, "content": clipped})
+        remaining -= len(clipped)
+        if remaining <= 2000:
+            remaining = 2000
+
+    new_total = sum(len(message["content"]) for message in compacted)
+    if new_total < total_chars:
+        warnings.append(
+            f"프롬프트가 {total_chars:,}자로 너무 커서 {new_total:,}자로 압축했습니다. "
+            "NMS 분석은 /api/nms/analyze의 compressed evidence 경로 사용을 권장합니다."
+        )
+    return compacted
 
 
 def split_system_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
@@ -1159,11 +1412,14 @@ def build_nms_evidence_digest(context: dict[str, Any]) -> str:
         matched = context.get("matched") or {}
         coverage = context.get("data_coverage") or {}
         analysis = context.get("deterministic_analysis") or {}
+        compressed = context.get("compressed_evidence") or {}
+        source_totals = compressed.get("source_totals") or {}
+        aggregates = compressed.get("aggregates") or {}
         top_signals = analysis.get("top_signals") or []
         hypotheses = analysis.get("root_cause_hypotheses") or []
         gaps = analysis.get("gaps") or []
         lines = [
-            "- 분석 기준: network evidence pack v1. NMS 요약은 참고 자료이며 최종 근거는 고객사별 원천 데이터와 규칙 판정이다.",
+            f"- 분석 기준: {context.get('evidence_pack_version') or 'network evidence pack'}. NMS 요약은 참고 자료이며 최종 근거는 고객사별 원천 데이터 집계와 규칙 판정이다.",
             f"- 매칭 고객/현장: customers={matched.get('customer_count', 0)}, sites={matched.get('site_count', 0)}, site_codes={matched.get('site_codes') or []}",
             (
                 "- 데이터 커버리지: "
@@ -1172,6 +1428,13 @@ def build_nms_evidence_digest(context: dict[str, Any]) -> str:
                 f"trap={coverage.get('trap_sample_count', 0)}, "
                 f"interfaces={coverage.get('interface_sample_count', 0)}"
             ),
+            (
+                "- 기간 전체 SQL 집계: "
+                f"syslog={((source_totals.get('syslog') or {}).get('total') or 0)}, "
+                f"trap={((source_totals.get('snmp_trap') or {}).get('total') or 0)}, "
+                f"polling={((source_totals.get('polling') or {}).get('total') or 0)}, "
+                f"interface={((source_totals.get('interface_metric') or {}).get('total') or 0)}"
+            ),
             f"- 상위 이상 신호: {len(top_signals)}건",
         ]
         for item in top_signals[:8]:
@@ -1179,6 +1442,14 @@ def build_nms_evidence_digest(context: dict[str, Any]) -> str:
                 f"  · {item.get('severity')} / {item.get('source_type')} / {item.get('signal_type')} / "
                 f"{item.get('site_name') or '-'} / {item.get('device_name') or '-'} / {item.get('evidence') or '-'}"
             )
+        top_apps = aggregates.get("syslog_top_apps") or []
+        if top_apps:
+            lines.append("- Syslog 앱별 상위:")
+            for item in top_apps[:6]:
+                lines.append(
+                    f"  · {item.get('app_name')}: {item.get('count')}건 / "
+                    f"last={item.get('last_seen_at')} / {item.get('sample_device') or '-'}"
+                )
         if hypotheses:
             lines.append("- 원인 후보 초안:")
             for item in hypotheses[:5]:
@@ -1228,11 +1499,18 @@ def build_nms_deterministic_brief(context: dict[str, Any]) -> str:
         matched = context.get("matched") or {}
         coverage = context.get("data_coverage") or {}
         analysis = context.get("deterministic_analysis") or {}
+        compressed = context.get("compressed_evidence") or {}
+        source_totals = compressed.get("source_totals") or {}
+        aggregates = compressed.get("aggregates") or {}
         signals = analysis.get("top_signals") or []
         timeline = analysis.get("timeline") or []
         hypotheses = analysis.get("root_cause_hypotheses") or []
         next_checks = analysis.get("required_next_checks") or []
         gaps = analysis.get("gaps") or []
+        protocol = analysis.get("protocol_analysis") or {}
+        dhcp = protocol.get("dhcp") or {}
+        dhcp_summary = dhcp.get("summary") or {}
+        dhcp_macs = dhcp.get("macs") or []
         lines = [
             "검증된 고객사별 네트워크 Evidence Pack",
             f"- 대상: {', '.join(matched.get('customer_names') or []) or requested.get('customer_name') or '전체'} / site_codes={matched.get('site_codes') or []}",
@@ -1244,13 +1522,40 @@ def build_nms_deterministic_brief(context: dict[str, Any]) -> str:
                 f"syslog={coverage.get('syslog_sample_count', 0)}, trap={coverage.get('trap_sample_count', 0)}, "
                 f"interface={coverage.get('interface_sample_count', 0)}"
             ),
+            (
+                "- 기간 전체 SQL 집계: "
+                f"syslog={((source_totals.get('syslog') or {}).get('total') or 0)}, "
+                f"trap={((source_totals.get('snmp_trap') or {}).get('total') or 0)}, "
+                f"polling={((source_totals.get('polling') or {}).get('total') or 0)}, "
+                f"interface={((source_totals.get('interface_metric') or {}).get('total') or 0)}"
+            ),
         ]
+        if dhcp_summary.get("total_events"):
+            lines.append(
+                "- DHCP 분석: "
+                f"risk={dhcp_summary.get('risk_level')}, events={dhcp_summary.get('total_events')}, "
+                f"unique_macs={dhcp_summary.get('unique_mac_count')}, note={dhcp_summary.get('note')}"
+            )
+            for item in dhcp_macs[:5]:
+                lines.append(
+                    f"  · MAC {item.get('mac')}: count={item.get('count')}, "
+                    f"events={item.get('event_types')}, interfaces={item.get('interfaces')}, vlans={item.get('vlans')}"
+                )
         if signals:
             lines.append("- 상위 이상 신호:")
             for item in signals[:10]:
                 lines.append(
                     f"  · {item.get('severity')} / {item.get('source_type')} / {item.get('signal_type')} / "
                     f"{item.get('site_name') or '-'} / {item.get('device_name') or '-'} / {item.get('evidence') or '-'}"
+                )
+        top_apps = aggregates.get("syslog_top_apps") or []
+        if top_apps:
+            lines.append("- Syslog 앱별 상위:")
+            for item in top_apps[:8]:
+                lines.append(
+                    f"  · {item.get('app_name')}: {item.get('count')}건 / "
+                    f"last={item.get('last_seen_at')} / {item.get('sample_device') or '-'} / "
+                    f"{clip_text(item.get('sample_message') or '', 90)}"
                 )
         if hypotheses:
             lines.append("- 원인 후보 초안:")
@@ -1359,14 +1664,19 @@ def build_nms_analysis_prompt(
     matched = context.get("matched") or {}
     customer_names = ", ".join(matched.get("customer_names") or []) or requested.get("customer_name") or "전체"
     evidence_digest = build_nms_evidence_digest(context)
-    data_text = json.dumps(context, ensure_ascii=False, indent=2)[:NMS_ANALYSIS_CONTEXT_CHAR_LIMIT]
+    llm_context = compact_nms_context_for_llm(context)
+    evidence_limit = min(NMS_ANALYSIS_CONTEXT_CHAR_LIMIT, NMS_LLM_EVIDENCE_CHAR_LIMIT)
+    data_text = clip_text(json.dumps(llm_context, ensure_ascii=False, indent=2), evidence_limit)
     if is_network_evidence_pack(context):
         command_set = context.get("codex_command_set") or {}
         system_prompt = (
             "너는 Codex가 지휘하는 고객사별 네트워크 장애 분석 보고 담당자다. "
-            "NMS 결과를 결론으로 추론하지 말고, network evidence pack의 원천 데이터, 규칙 기반 신호, "
-            "타임라인, 누락 데이터, Codex 명령 셋을 근거로만 판단한다. "
+            "NMS 결과를 결론으로 추론하지 말고, network evidence pack의 기간 전체 SQL 압축집계, "
+            "대표 원천 샘플, 규칙 기반 신호, 타임라인, 누락 데이터, Codex 명령 셋을 근거로만 판단한다. "
             "확정 사실/추정/누락 데이터/원격 확인/현장 확인/고객 보고 문안을 반드시 분리한다. "
+            "raw_evidence_samples는 샘플이고 기간 전체 판단은 compressed_evidence를 우선한다. "
+            "DHCP DISCOVER/OFFER 반복만으로 보안 위협이나 CRITICAL을 단정하지 않는다. "
+            "traffic.interfaces 또는 interface_metrics가 없으면 트래픽 정상/비정상을 단정하지 않는다. "
             "JSON에 없는 내용은 단정하지 말고 '자료 없음'으로 표시한다."
         )
         command_prompt = command_set.get("recommended_prompt") or ""
@@ -1377,7 +1687,8 @@ def build_nms_analysis_prompt(
             "NMS 원천 데이터를 근거로 장애 징후를 판단한다. 답변은 빠른 추측이 아니라 근거 기반 "
             "심층 분석이어야 한다. JSON에 없는 내용은 단정하지 말고 '자료 없음' 또는 '추정'으로 "
             "표시해라. 같은 말을 반복하지 말고, 시간/장비/수치/로그 문구를 근거로 인용해라. "
-            "숫자가 0인 항목은 반드시 '관측되지 않음'으로 해석하고, 없는 데이터를 만들어내지 마라."
+            "숫자가 0인 항목은 반드시 '관측되지 않음'으로 해석하고, 없는 데이터를 만들어내지 마라. "
+            "DHCP DISCOVER/OFFER 반복만으로 보안 위협을 단정하지 말고, 데이터 없음과 정상을 분리해라."
         )
         command_prompt = ""
     user_prompt = (
@@ -1388,10 +1699,11 @@ def build_nms_analysis_prompt(
         f"{f'Codex 표준 명령:\\n{command_prompt}\\n\\n' if command_prompt else ''}"
         f"{f'이전 저장 분석 참고:\\n{saved_context}\\n\\n' if saved_context else ''}"
         f"{f'외부 첨부자료 추출본:\\n{attachments_context}\\n\\n' if attachments_context else ''}"
-        f"Evidence Pack JSON:\n{data_text}\n\n"
+        f"LLM Safe Evidence Pack JSON:\n{data_text}\n\n"
         "분석 지침:\n"
         "- NMS 요약을 그대로 결론으로 쓰지 말고 고객사별 evidence pack의 원천 근거와 규칙 판정을 먼저 검증한다.\n"
-        "- 먼저 전체 JSON을 훑고, matched/sites/devices/traffic/logs/temporal 순서로 근거를 정리한다.\n"
+        "- 먼저 compressed_evidence.source_totals와 aggregates를 보고 기간 전체 경향을 잡은 뒤 raw_evidence_samples로 대표 로그를 검증한다.\n"
+        "- raw_evidence_samples의 샘플 건수를 전체 건수로 해석하지 않는다.\n"
         "- 이전 저장 분석은 참고용이다. 현재 로그/트래픽과 다른 부분이 있으면 차이를 먼저 설명한다.\n"
         "- 첨부자료가 있으면 현재 NMS 원천값과 모순되는지 먼저 비교하고, 첨부자료의 수치/표/문장을 근거에 함께 반영한다.\n"
         "- temporal.off_hours와 temporal.nas_file_risk가 있으면 새벽 이벤트, 랜섬웨어성 파일 작업, 반복 시간대를 별도 판단한다.\n"
@@ -1399,6 +1711,9 @@ def build_nms_analysis_prompt(
         "- temporal.nas_ransomware_findings가 있으면 33번 NMS 규칙 엔진의 1차 판정이다. LLM 판단보다 우선 근거로 삼고, severity/title/count/sample_message를 그대로 인용해라.\n"
         "- Grafana 화면은 NMS DB를 시각화한 것이므로, Grafana 값이라고 표현할 때도 JSON의 traffic/logs/temporal 원천값을 근거로 삼는다.\n"
         "- temporal.top_event_hours는 이벤트 발생 시간 분포다. traffic.interfaces가 없으면 트래픽량으로 해석하지 마라.\n"
+        "- deterministic_analysis.protocol_analysis.dhcp가 있으면 동일 MAC 반복, 다수 MAC 폭증, 다중 OFFER, gateway/DNS 변경, MAC 이동 후보를 분리해 해석한다.\n"
+        "- DHCP DISCOVER/OFFER 반복만 있으면 정상 IP 할당 과정일 수 있으므로 INFO 또는 낮은 신뢰도 주의로만 본다. 다중 DHCP OFFER, gateway/DNS 변경, MAC 다중 VLAN/포트 이동, STP/포트 flap/트래픽 오류가 동반될 때만 위험도를 올린다.\n"
+        "- SNMP Trap 0건은 장비 장애 근거가 아니라 trap 관측 없음이다. 데이터 없음과 정상은 다르다.\n"
         "- nas_file_risk.file_operation_count가 0이면 새벽 파일 삭제/이동/이름변경은 관측되지 않았다고 써라. 전체 시간대 파일작업 여부는 nas_file_activity로 따로 판단해라.\n"
         "- 이벤트가 많아도 정상 주기 작업일 가능성과 장애/보안 이벤트 가능성을 분리한다.\n"
         "- 근거가 부족하면 어떤 데이터가 더 필요한지 명확히 적는다.\n\n"
@@ -2074,6 +2389,11 @@ class Handler(BaseHTTPRequestHandler):
                     timeout=max(NMS_CONTEXT_TIMEOUT, 30),
                 )
             return self.json_response(result["data"], HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY)
+        if route == "/api/nms/operations":
+            return self.json_response(operations_dashboard_payload())
+        if route == "/api/nms/autopilot/history":
+            limit = int(first("limit", "20") or "20")
+            return self.json_response({"success": True, "items": list_autopilot_history(limit=limit)})
         if route == "/api/nms/monitor/status":
             return self.json_response(NMS_MONITOR.snapshot())
         if route == "/api/nms/monitor/refresh":
@@ -2175,6 +2495,7 @@ class Handler(BaseHTTPRequestHandler):
             system_messages, non_system_current = split_system_messages(current_messages)
             messages = [*system_messages, *history, *non_system_current]
 
+        messages = compact_messages_for_prompt_budget(messages, warnings)
         options = body.get("options") if isinstance(body.get("options"), dict) else {}
         for key in ("temperature", "num_ctx", "num_predict", "top_p", "top_k", "repeat_penalty"):
             if key in body:
@@ -2307,6 +2628,9 @@ class Handler(BaseHTTPRequestHandler):
                 "total_tokens": 0,
             },
             "conversation_id": payload.get("conversation_id"),
+            "warnings": payload.get("warnings") or [],
+            "model_requested": payload.get("model_requested"),
+            "gpu": payload.get("gpu"),
         }
         return self.json_response(completion, HTTPStatus.OK)
 
@@ -2554,6 +2878,21 @@ INDEX_HTML = r"""<!doctype html>
       border: 1px solid var(--line);
     }
     .metric b { font-size: 22px; letter-spacing: -0.04em; }
+    .ops-list { display: grid; gap: 8px; max-height: 360px; overflow: auto; padding-right: 2px; }
+    .ops-item {
+      display: grid;
+      gap: 8px;
+      padding: 11px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.045);
+    }
+    .ops-title { font-weight: 800; letter-spacing: -0.02em; }
+    .ops-meta, .ops-preview, .ops-empty { color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .ops-preview { color: #c7d7d4; }
+    .ops-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .ops-actions button { min-width: 0; padding: 8px 10px; font-size: 12px; }
+    .ops-section-title { color: var(--muted); font-size: 12px; font-weight: 800; margin-top: 2px; }
     .pill {
       display: inline-flex;
       align-items: center;
@@ -2666,6 +3005,28 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <div class="card stack">
         <div class="row" style="justify-content:space-between">
+          <strong>운영 데이터 열람</strong>
+          <span id="opsDataPill" class="pill warn">대기</span>
+        </div>
+        <div id="opsDataSummary" class="metric">
+          <span>자동분석/저장 분석</span><b style="font-size:14px">확인 전</b>
+        </div>
+        <div class="row">
+          <button class="secondary" onclick="loadOperationsDashboard()">운영 데이터 새로고침</button>
+          <button class="secondary" onclick="toggleOpsAutoRefresh()">운영 데이터 자동갱신</button>
+          <button class="secondary" onclick="loadNmsContext()">선택 원천 데이터 보기</button>
+        </div>
+        <div class="ops-section-title">자동분석 이력</div>
+        <div id="opsAutopilotList" class="ops-list">
+          <div class="ops-empty">토큰 저장 후 자동분석 이력을 불러옵니다.</div>
+        </div>
+        <div class="ops-section-title">최근 저장 분석</div>
+        <div id="opsSavedList" class="ops-list">
+          <div class="ops-empty">저장된 분석 결과가 여기에 표시됩니다.</div>
+        </div>
+      </div>
+      <div class="card stack">
+        <div class="row" style="justify-content:space-between">
           <strong>업체/현장 분석 보관함</strong>
           <span id="savedAnalysisCount" class="pill warn">0건</span>
         </div>
@@ -2740,6 +3101,8 @@ INDEX_HTML = r"""<!doctype html>
     let healthTimer = null;
     let conversations = [];
     let savedAnalyses = [];
+    let operationsDashboard = null;
+    let opsRefreshTimer = null;
     let currentConversationId = localStorage.getItem(conversationKey) || "";
     $("token").value = localStorage.getItem(tokenKey) || "";
 
@@ -2749,6 +3112,7 @@ INDEX_HTML = r"""<!doctype html>
       loadConversations();
       loadNmsCustomers();
       refreshNmsMonitor();
+      loadOperationsDashboard(true);
       loadSavedAnalyses(true);
     }
 
@@ -2762,6 +3126,20 @@ INDEX_HTML = r"""<!doctype html>
 
     function setResult(value) {
       $("result").textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      }[ch]));
+    }
+
+    function compactTime(value) {
+      return String(value || "").replace("T", " ").replace("Z", "").slice(0, 16) || "-";
     }
 
     function formatBytes(bytes) {
@@ -3106,6 +3484,142 @@ INDEX_HTML = r"""<!doctype html>
       updateSavedAnalysisStatus("선택 저장 분석을 삭제했습니다.");
     }
 
+    function opsTargetLabel(item) {
+      const target = item?.target || {};
+      return [
+        target.customer_name || item.customer_name || "",
+        target.site_name || target.site_code || item.site_name || item.site_code || "",
+      ].filter(Boolean).join(" / ") || item.title || "대상 미확인";
+    }
+
+    function renderOperationsDashboard(data) {
+      const monitor = data.monitor || {};
+      const autopilot = data.autopilot || {};
+      const summary = monitor.summary || {};
+      const autoSummary = autopilot.summary || {};
+      const history = data.autopilot_history || [];
+      const saved = data.saved_analyses || [];
+      const store = data.conversation_store || {};
+      $("opsDataPill").className = monitor.ok ? "pill" : "pill warn";
+      $("opsDataPill").textContent = monitor.ok ? "열람 가능" : "NMS 확인 필요";
+      $("opsDataSummary").innerHTML = `
+        <span>생성 ${compactTime(data.generated_at)} · 자동 ${compactTime(autopilot.last_run_at)}</span>
+        <b style="font-size:14px">
+          고객 ${summary.customer_count || 0} · 이벤트 ${summary.recent_event_count || 0}
+          · 자동분석 ${history.length}건 · 저장 ${store.saved_analyses || saved.length || 0}건
+          · 후보 ${autoSummary.candidate_count || 0}
+        </b>
+      `;
+      $("opsAutopilotList").innerHTML = history.length ? history.map((item) => `
+        <div class="ops-item">
+          <div class="ops-title">${escapeHtml(opsTargetLabel(item))}</div>
+          <div class="ops-meta">
+            ${escapeHtml(compactTime(item.updated_at))} · 메시지 ${item.message_count || 0} · ${escapeHtml(item.id)}
+          </div>
+          <div class="ops-preview">${escapeHtml(item.latest_assistant_preview || item.latest_user || "최근 자동분석 내용 없음")}</div>
+          <div class="ops-actions">
+            <button class="secondary" onclick="openAutopilotConversation('${escapeHtml(item.id)}')">대화 열기</button>
+          </div>
+        </div>
+      `).join("") : '<div class="ops-empty">자동분석 대화 이력이 아직 없습니다.</div>';
+      $("opsSavedList").innerHTML = saved.length ? saved.slice(0, 8).map((item) => `
+        <div class="ops-item">
+          <div class="ops-title">${escapeHtml(item.title || "저장 분석")}</div>
+          <div class="ops-meta">
+            ${escapeHtml(item.customer_name || "고객사 미지정")} / ${escapeHtml(item.site_name || item.site_code || "전체 현장")}
+            · ${escapeHtml(compactTime(item.updated_at))}
+          </div>
+          <div class="ops-preview">${escapeHtml(item.content_preview || item.question || "미리보기 없음")}</div>
+          <div class="ops-actions">
+            <button class="secondary" onclick="loadSavedAnalysisById('${escapeHtml(item.id)}')">저장분석 열기</button>
+          </div>
+        </div>
+      `).join("") : '<div class="ops-empty">최근 저장 분석이 없습니다.</div>';
+    }
+
+    async function loadOperationsDashboard(silent = false) {
+      try {
+        const data = await api("/api/nms/operations", {headers: headers()});
+        operationsDashboard = data;
+        renderOperationsDashboard(data);
+        if (!silent) {
+          setResult({
+            status: "운영 데이터 열람 갱신 완료",
+            generated_at: data.generated_at,
+            monitor_summary: data.monitor?.summary || {},
+            autopilot_summary: data.autopilot?.summary || {},
+            saved_analyses: (data.saved_analyses || []).length,
+          });
+        }
+      } catch (err) {
+        $("opsDataPill").className = "pill bad";
+        $("opsDataPill").textContent = "열람 실패";
+        $("opsDataSummary").innerHTML = `<span>오류</span><b style="font-size:14px">${escapeHtml(String(err))}</b>`;
+        if (!silent) setResult(`운영 데이터를 불러오지 못했습니다.\n${String(err)}`);
+      }
+    }
+
+    function toggleOpsAutoRefresh() {
+      if (opsRefreshTimer) {
+        clearInterval(opsRefreshTimer);
+        opsRefreshTimer = null;
+        $("opsDataPill").textContent = "자동갱신 중지";
+        return;
+      }
+      loadOperationsDashboard(true);
+      opsRefreshTimer = setInterval(() => loadOperationsDashboard(true), 60000);
+      $("opsDataPill").textContent = "자동갱신 중";
+    }
+
+    async function openAutopilotConversation(conversationId) {
+      if (!conversationId) return;
+      const data = await api(`/api/conversations/${encodeURIComponent(conversationId)}?limit=80`, {headers: headers()});
+      const conversation = data.conversation || {};
+      currentConversationId = conversation.id || conversationId;
+      localStorage.setItem(conversationKey, currentConversationId);
+      const target = conversation.meta?.target || {};
+      if (target.customer_name) $("customer").value = target.customer_name;
+      if (target.customer_name) {
+        const customer = nmsCustomers.find((entry) => entry.customer_name === target.customer_name);
+        if (customer) {
+          $("nmsCustomer").value = customer.customer_name;
+          selectNmsCustomer();
+          if (target.site_code) {
+            $("nmsSite").value = target.site_code;
+            selectNmsSite();
+          }
+        }
+      }
+      $("savedAnalysisTitle").value ||= `${opsTargetLabel({target, title: conversation.title})} 자동분석`;
+      const messages = (conversation.messages || []).slice(-12).map((message) => {
+        const role = message.role === "assistant" ? "LLM 분석" : "요청/근거";
+        return `[${role} · ${compactTime(message.created_at)}]\n${message.content || ""}`;
+      }).join("\n\n---\n\n");
+      setResult(messages || "자동분석 대화 내용이 없습니다.");
+      await loadConversations();
+    }
+
+    async function loadSavedAnalysisById(analysisId) {
+      if (!analysisId) return;
+      const select = $("savedAnalysisSelect");
+      const exists = Array.from(select.options || []).some((opt) => String(opt.value) === String(analysisId));
+      if (exists) {
+        select.value = String(analysisId);
+        return loadSavedAnalysis();
+      }
+      const data = await api(`/api/saved-analyses/${encodeURIComponent(analysisId)}`, {headers: headers()});
+      const item = data.item || {};
+      if (item.customer_name) $("customer").value = item.customer_name;
+      if (item.analysis_kind && [...$("template").options].some((opt) => opt.value === item.analysis_kind)) {
+        $("template").value = item.analysis_kind;
+      }
+      $("savedAnalysisTitle").value = item.title || "";
+      $("question").value = item.question || $("question").value;
+      $("prompt").value = item.source_excerpt || $("prompt").value;
+      setResult(item.content || "저장 내용이 없습니다.");
+      updateSavedAnalysisStatus(`저장 분석 ${item.id || analysisId}번을 불러왔습니다.`);
+    }
+
     function renderHealthMetrics(health, runningModels = null) {
       $("statusPill").className = health.ollama.reachable ? "pill" : "pill bad";
       $("statusPill").textContent = health.ollama.reachable ? "Ollama 연결 정상" : "Ollama 연결 실패";
@@ -3175,6 +3689,7 @@ INDEX_HTML = r"""<!doctype html>
       await loadConversations();
       await refreshNmsMonitor();
       await loadNmsCustomers();
+      await loadOperationsDashboard(true);
       await loadSavedAnalyses(true);
     }
 
@@ -3526,6 +4041,7 @@ INDEX_HTML = r"""<!doctype html>
     loadConversations();
     refreshNmsMonitor();
     loadNmsCustomers();
+    loadOperationsDashboard(true);
     loadSavedAnalyses(true);
     renderAttachmentSummary();
   </script>

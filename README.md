@@ -61,7 +61,8 @@ curl -sS -H "X-LLM-Ops-Token: $TOKEN" \
 - 같은 현장 반복 분석은 `NMS_AUTOPILOT_TARGET_COOLDOWN_SECONDS`로 제한합니다. 기본값은 30분입니다.
 - 수동 `POST /api/nms/analyze`는 긴 심층분석, Autopilot은 짧고 반복적인 상시 분석입니다. 자동분석의 출력 길이는 `NMS_AUTOPILOT_NUM_PREDICT`로 제한합니다.
 - 33번 NMS가 제공하는 `temporal.nas_ransomware_findings`는 규칙 기반 1차 경보로 취급하고, LLM 분석에서 severity/title/count/sample message를 우선 근거로 인용합니다.
-- 33번 NMS가 `network-evidence-pack` API를 제공하면 NMS 심층분석은 기존 `nms-context` 대신 이 고객사별 evidence pack을 우선 사용합니다. NMS 요약은 참고 자료이며, 최종 답변은 원천 데이터와 규칙 기반 신호를 근거로 작성합니다.
+- 33번 NMS가 `network-evidence-pack` API를 제공하면 NMS 심층분석은 기존 `nms-context` 대신 이 고객사별 evidence pack을 우선 사용합니다. 33번은 기간 전체 원천 데이터를 `compressed_evidence`로 먼저 집계하고, 118번은 이 집계와 대표 샘플을 LLM 입력으로 압축해 사용합니다.
+- 과도한 원문 프롬프트가 들어오면 Ollama가 내부에서 임의 절단하기 전에 118번이 `LLM_OPS_MAX_PROMPT_CHARS`, `LLM_OPS_MAX_SINGLE_MESSAGE_CHARS`, `NMS_LLM_EVIDENCE_CHAR_LIMIT` 기준으로 명시적으로 압축하고 경고를 반환합니다.
 - 웹 콘솔의 `업체/현장 분석 보관함`은 고객사/현장별 분석 결과를 별도 저장하고, 같은 범위로 다시 분석할 때 저장 이력을 자동 참고 문맥으로 넣습니다.
 - 저장 분석은 `conversations.sqlite3` 내부 `saved_analyses` 테이블에 들어가며, 현재 UI에서는 저장/불러오기/삭제만 제공하고 수정은 새 저장으로 남깁니다.
 - 일반 채팅은 별도 시스템 지시가 없으면 기본 응답 언어를 한국어로 유지합니다. 다른 언어를 명시적으로 요청하면 그 요청을 따릅니다.
