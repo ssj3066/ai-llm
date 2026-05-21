@@ -4410,6 +4410,7 @@ INDEX_HTML = r"""<!doctype html>
       cursor: pointer;
     }
     button.secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
     details.advanced {
       border: 1px solid var(--line);
       border-radius: 16px;
@@ -4553,6 +4554,7 @@ INDEX_HTML = r"""<!doctype html>
           </div>
         </div>
         <div class="row">
+          <button id="nmsBackButton" class="secondary" onclick="goBackNmsMenu()" disabled>이전 메뉴</button>
           <button class="secondary" onclick="loadNmsCustomers()">업체/상태 새로고침</button>
           <button class="secondary" onclick="toggleNmsMonitor()">상태카드 자동갱신</button>
         </div>
@@ -4663,6 +4665,9 @@ INDEX_HTML = r"""<!doctype html>
     let savedAnalyses = [];
     let operationsDashboard = null;
     let opsRefreshTimer = null;
+    let nmsNavigationStack = [];
+    let currentNmsMenuState = null;
+    let isRestoringNmsMenu = false;
     let currentConversationId = localStorage.getItem(conversationKey) || "";
     $("token").value = localStorage.getItem(tokenKey) || "";
 
@@ -5309,9 +5314,60 @@ INDEX_HTML = r"""<!doctype html>
       return normalizeSearchText(`${customer.customer_name || ""} ${customer.customer_code || ""} ${siteText}`);
     }
 
-    function renderNmsCustomers() {
+    function nmsMenuState() {
+      return {
+        customerSearch: $("nmsCustomerSearch")?.value || "",
+        customerName: $("nmsCustomer")?.value || "",
+        siteCode: $("nmsSite")?.value || "",
+        template: $("template")?.value || "",
+        question: $("question")?.value || "",
+        scrollY: Math.max(0, window.scrollY || 0),
+      };
+    }
+
+    function sameNmsMenuState(left, right) {
+      if (!left || !right) return false;
+      return left.customerSearch === right.customerSearch
+        && left.customerName === right.customerName
+        && left.siteCode === right.siteCode
+        && left.template === right.template
+        && left.question === right.question;
+    }
+
+    function updateNmsBackButton() {
+      const button = $("nmsBackButton");
+      if (!button) return;
+      button.disabled = nmsNavigationStack.length === 0;
+      button.title = nmsNavigationStack.length ? "직전 업체/현장 메뉴로 돌아갑니다." : "이전 메뉴가 없습니다.";
+    }
+
+    function pushNmsMenuState(state) {
+      if (!state) return;
+      const last = nmsNavigationStack[nmsNavigationStack.length - 1];
+      if (sameNmsMenuState(last, state)) return;
+      nmsNavigationStack.push({...state});
+      if (nmsNavigationStack.length > 25) {
+        nmsNavigationStack.shift();
+      }
+      updateNmsBackButton();
+    }
+
+    function trackNmsMenuChange() {
+      if (isRestoringNmsMenu) return;
+      const next = nmsMenuState();
+      if (currentNmsMenuState && !sameNmsMenuState(currentNmsMenuState, next)) {
+        pushNmsMenuState(currentNmsMenuState);
+      }
+    }
+
+    function settleNmsMenuState() {
+      currentNmsMenuState = nmsMenuState();
+      updateNmsBackButton();
+    }
+
+    function renderNmsCustomers(options = {}) {
       const select = $("nmsCustomer");
-      const previousValue = select.value;
+      const previousValue = options.selectedCustomerName ?? select.value;
       const keyword = normalizeSearchText($("nmsCustomerSearch")?.value || "");
       const filtered = keyword
         ? nmsCustomers.filter((customer) => nmsCustomerSearchText(customer).includes(keyword))
@@ -5333,7 +5389,7 @@ INDEX_HTML = r"""<!doctype html>
           ? `${filtered.length}/${nmsCustomers.length}개 업체 표시`
           : `${nmsCustomers.length}개 업체 표시`;
       }
-      selectNmsCustomer();
+      selectNmsCustomer({trackHistory: false, preserveSiteCode: options.preserveSiteCode || ""});
     }
 
     async function loadNmsCustomers() {
@@ -5364,11 +5420,16 @@ INDEX_HTML = r"""<!doctype html>
       return nmsCustomers.find(c => c.customer_name === name) || null;
     }
 
-    function selectNmsCustomer() {
+    function selectNmsCustomer(options = {}) {
+      if (options.trackHistory !== false) {
+        trackNmsMenuChange();
+      }
       const customer = selectedCustomer();
       const siteSelect = $("nmsSite");
+      const preservedSiteCode = options.preserveSiteCode || "";
       siteSelect.innerHTML = '<option value="">전체 현장</option>';
       if (!customer) {
+        settleNmsMenuState();
         loadSavedAnalyses(true);
         return;
       }
@@ -5382,13 +5443,52 @@ INDEX_HTML = r"""<!doctype html>
         opt.textContent = `${site.site_name} / ${site.site_code} (${site.recent_event_count || 0})`;
         siteSelect.appendChild(opt);
       }
+      if (preservedSiteCode && (customer.sites || []).some((site) => site.site_code === preservedSiteCode)) {
+        siteSelect.value = preservedSiteCode;
+      }
+      settleNmsMenuState();
       loadSavedAnalyses(true);
     }
 
-    function selectNmsSite() {
+    function selectNmsSite(options = {}) {
+      if (options.trackHistory !== false) {
+        trackNmsMenuChange();
+      }
       const customer = selectedCustomer();
       if (customer) $("customer").value = customer.customer_name;
+      settleNmsMenuState();
       loadSavedAnalyses(true);
+    }
+
+    function goBackNmsMenu() {
+      const previous = nmsNavigationStack.pop();
+      updateNmsBackButton();
+      if (!previous) {
+        setResult("이전 업체/현장 메뉴가 없습니다.");
+        return;
+      }
+      isRestoringNmsMenu = true;
+      try {
+        $("nmsCustomerSearch").value = previous.customerSearch || "";
+        renderNmsCustomers({
+          selectedCustomerName: previous.customerName || "",
+          preserveSiteCode: previous.siteCode || "",
+        });
+        if (previous.template && [...$("template").options].some((opt) => opt.value === previous.template)) {
+          $("template").value = previous.template;
+        }
+        $("question").value = previous.question || "";
+        if (previous.siteCode && $("nmsSite").value !== previous.siteCode) {
+          $("nmsSite").value = previous.siteCode;
+        }
+        selectNmsSite({trackHistory: false});
+        if (Number.isFinite(previous.scrollY)) {
+          window.scrollTo({top: previous.scrollY, behavior: "auto"});
+        }
+        settleNmsMenuState();
+      } finally {
+        isRestoringNmsMenu = false;
+      }
     }
 
     async function loadNmsContext() {
