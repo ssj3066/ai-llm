@@ -1,6 +1,6 @@
 # Metro LLM Ops for 118
 
-118번 GPU 서버에서 Ollama 기반 로컬 LLM을 운영하기 위한 단일 Python 서비스입니다.
+118번 GPU 서버에서 SGLang 기반 로컬 LLM을 운영하기 위한 단일 Python 서비스입니다.
 
 ## 기능
 
@@ -43,13 +43,21 @@ sudo systemctl restart metro-llm-ops.service
 sudo journalctl -u metro-llm-ops.service -f
 ```
 
+## SGLang 운영 기본값
+
+- 기본 추론 경로는 SGLang입니다. `OLLAMA_ENABLED=false`, `SGLANG_ENABLED=true`를 기준으로 운영합니다.
+- 고객/업무 화면에는 `LLM_OPS_PUBLIC_MODELS`에 정의한 3개 프로파일만 노출합니다: `metro-fast:sglang`, `metro-analysis:sglang`, `metro-report:sglang`.
+- 3개 프로파일은 현재 운영 체크포인트 `Qwen/Qwen3-4B-Instruct-2507`로 연결합니다. 역할 구분은 고객 응대/상태 점검/보고서 워크플로우 기준으로 유지하고, 물리 모델 교체는 alias 매핑으로 처리합니다.
+- SGLang 런타임은 `SGLANG_KV_CACHE_DTYPE=fp8_e5m2`와 `SGLANG_ENABLE_CACHE_REPORT=true`를 사용합니다.
+- `SGLANG_QUANTIZATION`은 AWQ/GPTQ/FP8 등 양자화 체크포인트를 별도로 배치했을 때만 설정합니다. 일반 BF16/FP16 체크포인트에 임의로 켜지 않습니다.
+
 ## API 호출 예시
 
 ```bash
 TOKEN="$(grep '^LLM_OPS_TOKEN=' /home/metroai/llm-ops/llm-ops.env | cut -d= -f2-)"
 curl -sS -H "X-LLM-Ops-Token: $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"model":"metro-report:latest","prompt":"돈우 NMS 로그 분석 기준을 한 문장으로 설명해줘."}' \
+  -d '{"model":"metro-analysis:sglang","prompt":"돈우 NMS 로그 분석 기준을 한 문장으로 설명해줘."}' \
   http://192.168.1.118:8090/api/chat
 ```
 
@@ -61,7 +69,8 @@ curl -sS -H "X-LLM-Ops-Token: $TOKEN" \
 - 같은 현장 반복 분석은 `NMS_AUTOPILOT_TARGET_COOLDOWN_SECONDS`로 제한합니다. 기본값은 30분입니다.
 - 수동 `POST /api/nms/analyze`는 긴 심층분석, Autopilot은 짧고 반복적인 상시 분석입니다. 자동분석의 출력 길이는 `NMS_AUTOPILOT_NUM_PREDICT`로 제한합니다.
 - 33번 NMS가 제공하는 `temporal.nas_ransomware_findings`는 규칙 기반 1차 경보로 취급하고, LLM 분석에서 severity/title/count/sample message를 우선 근거로 인용합니다.
-- 33번 NMS가 `network-evidence-pack` API를 제공하면 NMS 심층분석은 기존 `nms-context` 대신 이 고객사별 evidence pack을 우선 사용합니다. NMS 요약은 참고 자료이며, 최종 답변은 원천 데이터와 규칙 기반 신호를 근거로 작성합니다.
+- 33번 NMS가 `network-evidence-pack` API를 제공하면 NMS 심층분석은 기존 `nms-context` 대신 이 고객사별 evidence pack을 우선 사용합니다. 33번은 기간 전체 원천 데이터를 `compressed_evidence`로 먼저 집계하고, 118번은 이 집계와 대표 샘플을 LLM 입력으로 압축해 사용합니다.
+- 과도한 원문 프롬프트가 들어오면 Ollama가 내부에서 임의 절단하기 전에 118번이 `LLM_OPS_MAX_PROMPT_CHARS`, `LLM_OPS_MAX_SINGLE_MESSAGE_CHARS`, `NMS_LLM_EVIDENCE_CHAR_LIMIT` 기준으로 명시적으로 압축하고 경고를 반환합니다.
 - 웹 콘솔의 `업체/현장 분석 보관함`은 고객사/현장별 분석 결과를 별도 저장하고, 같은 범위로 다시 분석할 때 저장 이력을 자동 참고 문맥으로 넣습니다.
 - 저장 분석은 `conversations.sqlite3` 내부 `saved_analyses` 테이블에 들어가며, 현재 UI에서는 저장/불러오기/삭제만 제공하고 수정은 새 저장으로 남깁니다.
 - 일반 채팅은 별도 시스템 지시가 없으면 기본 응답 언어를 한국어로 유지합니다. 다른 언어를 명시적으로 요청하면 그 요청을 따릅니다.
@@ -69,12 +78,12 @@ curl -sS -H "X-LLM-Ops-Token: $TOKEN" \
 - `XLS`, `DOC`는 LibreOffice가 있으면 텍스트 변환 후 분석하고, 없으면 `strings` 기반 보조 추출로 처리합니다.
 - 기본 첨부 제한은 `최대 5개`, `파일당 5MB`, `전체 12MB`입니다.
 - 웹 콘솔 상단 GPU/VRAM/실행모델 카드는 10초마다 자동 갱신됩니다.
-- 기본 모델은 보고서/분석용 `metro-report:latest`입니다.
-- 빠른 단문/상태 점검은 `metro-fast:latest`를 사용합니다.
+- 기본 모델은 고객/현장 분석용 `metro-analysis:sglang`입니다.
+- 빠른 단문/상태 점검은 `metro-fast:sglang`, 보고서형 응답은 `metro-report:sglang`를 사용합니다.
 - 웹 콘솔에서 선택한 모델은 채팅, 일반 분석, NMS 분석, 프리로드, 언로드, 벤치마크 요청에 그대로 전달됩니다.
-- 설치되지 않은 모델이나 timeout 실패는 `LLM_OPS_MODEL_FALLBACK_ENABLED=true`일 때만 기본 모델로 재시도합니다.
+- 설치되지 않은 모델이나 timeout 실패는 `LLM_OPS_MODEL_FALLBACK_ENABLED=true`일 때만 기본 모델로 재시도합니다. SGLang 단일 운영에서는 기본값을 `false`로 두어 의도하지 않은 모델 전환을 막습니다.
 - GPU 실행 모델 전환을 강제로 막아야 하는 운영 상황에서는 `LLM_OPS_MODEL_RUNNING_SWITCH_GUARD_ENABLED=true`를 설정합니다. 기본값은 `false`입니다.
-- 16GB VRAM에서 모델 전환이 지연되지 않도록 기본값은 `LLM_OPS_MODEL_AUTO_UNLOAD_BEFORE_SWITCH_ENABLED=true`입니다. 선택 모델 실행 전 기존 실행 모델을 먼저 언로드합니다.
+- SGLang 단일 운영에서는 `LLM_OPS_MODEL_AUTO_UNLOAD_BEFORE_SWITCH_ENABLED=false`를 기본으로 둡니다. 모델 전환은 SGLang 체크포인트 교체 작업으로 별도 처리합니다.
 - 웹 콘솔은 기본 업무 버튼을 우선 표시하고, 프리로드/언로드/벤치마크는 `고급 모델 작업` 영역에 접어 둡니다.
 - 표준 사용 흐름은 `모델 선택 -> 업체/현장 선택 -> 분석 기능 선택 -> 분석 실행 -> 이어 묻기 -> 결과 저장`입니다.
 - `상태카드 자동갱신`은 답변 생성이 아니라 NMS 상태 카드만 60초마다 새로 읽는 선택 기능입니다.

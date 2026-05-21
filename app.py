@@ -9,6 +9,7 @@ web UI for operators and future ERP/NMS integrations.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import os
@@ -28,6 +29,7 @@ import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile
+from collections import Counter, OrderedDict
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -59,9 +61,41 @@ load_env_file(ENV_FILE)
 HOST = os.getenv("LLM_OPS_HOST", "0.0.0.0")
 PORT = int(os.getenv("LLM_OPS_PORT", "8090"))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_ENABLED = os.getenv("OLLAMA_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+OLLAMA_CPU_ONLY_MODELS_RAW = os.getenv("LLM_OPS_OLLAMA_CPU_ONLY_MODELS", "qwen3:14b")
+OLLAMA_KEEP_SGLANG_MODELS_RAW = os.getenv("LLM_OPS_OLLAMA_KEEP_SGLANG_MODELS", "qwen3:14b")
+OLLAMA_MODEL_NUM_CTX_RAW = os.getenv("LLM_OPS_OLLAMA_MODEL_NUM_CTX", "qwen3:14b=8192")
+OLLAMA_MODEL_NUM_GPU_RAW = os.getenv("LLM_OPS_OLLAMA_MODEL_NUM_GPU", "qwen3:14b=0")
+OLLAMA_MODEL_NUM_THREAD_RAW = os.getenv("LLM_OPS_OLLAMA_MODEL_NUM_THREAD", "qwen3:14b=6")
+OLLAMA_MODEL_NUM_PREDICT_RAW = os.getenv("LLM_OPS_OLLAMA_MODEL_NUM_PREDICT", "qwen3:14b=1400")
+OLLAMA_DISABLE_THINK_MODELS_RAW = os.getenv("LLM_OPS_OLLAMA_DISABLE_THINK_MODELS", "qwen3:14b")
+SGLANG_ENABLED = os.getenv("SGLANG_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+SGLANG_BASE_URL = os.getenv("SGLANG_BASE_URL", "http://127.0.0.1:30000").rstrip("/")
+SGLANG_MODEL = os.getenv("SGLANG_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+SGLANG_DEFAULT_AVAILABLE_MODELS = f"{SGLANG_MODEL},Qwen/Qwen3-4B-Instruct-2507"
+SGLANG_AVAILABLE_MODELS_RAW = os.getenv("SGLANG_AVAILABLE_MODELS", SGLANG_DEFAULT_AVAILABLE_MODELS)
+SGLANG_MODEL_CONTEXT_LENGTHS_RAW = os.getenv(
+    "SGLANG_MODEL_CONTEXT_LENGTHS",
+    "Qwen/Qwen2.5-0.5B-Instruct=16384,Qwen/Qwen3-4B-Instruct-2507=32768",
+)
+SGLANG_MODEL_MEM_FRACTIONS_RAW = os.getenv(
+    "SGLANG_MODEL_MEM_FRACTIONS",
+    "Qwen/Qwen2.5-0.5B-Instruct=0.85,Qwen/Qwen3-4B-Instruct-2507=0.82",
+)
+SGLANG_AUTO_SWITCH_ENABLED = os.getenv("SGLANG_AUTO_SWITCH_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+SGLANG_REQUEST_TIMEOUT = int(os.getenv("SGLANG_REQUEST_TIMEOUT_SECONDS", "600"))
+SGLANG_START_SCRIPT = os.getenv("SGLANG_START_SCRIPT", "/home/metroai/sglang-runtime/start-sglang.sh")
+SGLANG_STOP_SCRIPT = os.getenv("SGLANG_STOP_SCRIPT", "/home/metroai/sglang-runtime/stop-sglang.sh")
+SGLANG_START_WAIT_SECONDS = int(os.getenv("SGLANG_START_WAIT_SECONDS", "90"))
+SGLANG_RUNTIME_ENV_FILE = Path(os.getenv("SGLANG_RUNTIME_ENV_FILE", "/home/metroai/sglang-runtime/sglang.env"))
 API_TOKEN = os.getenv("LLM_OPS_TOKEN", "")
 DEFAULT_MODEL = os.getenv("LLM_OPS_DEFAULT_MODEL", "metro-report:latest")
 FAST_MODEL = os.getenv("LLM_OPS_FAST_MODEL", "metro-fast:latest")
+MODEL_ALIASES_RAW = os.getenv(
+    "LLM_OPS_MODEL_ALIASES",
+    f"metro-report:latest={SGLANG_MODEL},metro-fast:latest={SGLANG_MODEL}",
+)
+PUBLIC_MODEL_IDS_RAW = os.getenv("LLM_OPS_PUBLIC_MODELS", "")
 DEFAULT_CHAT_SYSTEM_PROMPT = os.getenv(
     "LLM_OPS_DEFAULT_CHAT_SYSTEM_PROMPT",
     "기본 응답 언어는 한국어다. 사용자가 다른 언어를 명시적으로 요청하지 않으면 자연스럽고 간결한 한국어로 답해라.",
@@ -73,6 +107,7 @@ KOREAN_RESPONSE_GUARD = (
 REQUEST_TIMEOUT = int(os.getenv("LLM_OPS_REQUEST_TIMEOUT_SECONDS", "600"))
 MAX_BODY_BYTES = int(os.getenv("LLM_OPS_MAX_BODY_BYTES", str(16 * 1024 * 1024)))
 KEEP_ALIVE = os.getenv("LLM_OPS_KEEP_ALIVE", "30m")
+LLM_OPS_DEFAULT_NUM_CTX = int(os.getenv("LLM_OPS_DEFAULT_NUM_CTX", "16384"))
 ALLOWED_ORIGIN = os.getenv("LLM_OPS_ALLOWED_ORIGIN", "*")
 MODEL_FALLBACK_ENABLED = os.getenv("LLM_OPS_MODEL_FALLBACK_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 MODEL_RUNNING_SWITCH_GUARD_ENABLED = os.getenv(
@@ -88,6 +123,9 @@ KOREAN_RETRY_ENABLED = os.getenv("LLM_OPS_KOREAN_RETRY_ENABLED", "true").strip()
 NMS_CONTEXT_BASE_URL = os.getenv("NMS_CONTEXT_BASE_URL", "http://192.168.1.33:7443").rstrip("/")
 NMS_CONTEXT_TOKEN = os.getenv("NMS_CONTEXT_TOKEN", "")
 NMS_CONTEXT_TIMEOUT = int(os.getenv("NMS_CONTEXT_TIMEOUT_SECONDS", "12"))
+NMS_CONTEXT_CACHE_ENABLED = os.getenv("NMS_CONTEXT_CACHE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+NMS_CONTEXT_CACHE_TTL_SECONDS = int(os.getenv("NMS_CONTEXT_CACHE_TTL_SECONDS", "30"))
+NMS_CONTEXT_CACHE_MAX_ITEMS = int(os.getenv("NMS_CONTEXT_CACHE_MAX_ITEMS", "64"))
 NMS_MONITOR_ENABLED = os.getenv("NMS_MONITOR_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 NMS_MONITOR_INTERVAL = int(os.getenv("NMS_MONITOR_INTERVAL_SECONDS", "60"))
 NMS_MONITOR_WINDOW_HOURS = int(os.getenv("NMS_MONITOR_WINDOW_HOURS", "24"))
@@ -95,6 +133,9 @@ NMS_MONITOR_LIMIT = int(os.getenv("NMS_MONITOR_LIMIT", "500"))
 NMS_DEEP_ANALYSIS_WINDOW_HOURS = int(os.getenv("NMS_DEEP_ANALYSIS_WINDOW_HOURS", "48"))
 NMS_DEEP_ANALYSIS_LIMIT = int(os.getenv("NMS_DEEP_ANALYSIS_LIMIT", "80"))
 NMS_ANALYSIS_CONTEXT_CHAR_LIMIT = int(os.getenv("NMS_ANALYSIS_CONTEXT_CHAR_LIMIT", "90000"))
+NMS_LLM_EVIDENCE_CHAR_LIMIT = int(os.getenv("NMS_LLM_EVIDENCE_CHAR_LIMIT", "25000"))
+LLM_OPS_MAX_PROMPT_CHARS = int(os.getenv("LLM_OPS_MAX_PROMPT_CHARS", "50000"))
+LLM_OPS_MAX_SINGLE_MESSAGE_CHARS = int(os.getenv("LLM_OPS_MAX_SINGLE_MESSAGE_CHARS", "30000"))
 NMS_ANALYSIS_TIMEOUT = int(os.getenv("NMS_ANALYSIS_TIMEOUT_SECONDS", "900"))
 NMS_ANALYSIS_NUM_CTX = int(os.getenv("NMS_ANALYSIS_NUM_CTX", "16384"))
 NMS_ANALYSIS_NUM_PREDICT = int(os.getenv("NMS_ANALYSIS_NUM_PREDICT", "3072"))
@@ -110,7 +151,7 @@ NMS_AUTOPILOT_CONVERSATION_PREFIX = os.getenv("NMS_AUTOPILOT_CONVERSATION_PREFIX
 NMS_AUTOPILOT_MIN_EVENT_COUNT = int(os.getenv("NMS_AUTOPILOT_MIN_EVENT_COUNT", "1"))
 NMS_AUTOPILOT_START_DELAY_SECONDS = int(os.getenv("NMS_AUTOPILOT_START_DELAY_SECONDS", "30"))
 NMS_AUTOPILOT_TIMEOUT = int(os.getenv("NMS_AUTOPILOT_TIMEOUT_SECONDS", "300"))
-NMS_AUTOPILOT_NUM_CTX = int(os.getenv("NMS_AUTOPILOT_NUM_CTX", "8192"))
+NMS_AUTOPILOT_NUM_CTX = int(os.getenv("NMS_AUTOPILOT_NUM_CTX", "16384"))
 NMS_AUTOPILOT_NUM_PREDICT = int(os.getenv("NMS_AUTOPILOT_NUM_PREDICT", "1200"))
 CONVERSATION_DB_PATH = Path(os.getenv("LLM_OPS_CONVERSATION_DB", str(APP_DIR / "data" / "conversations.sqlite3")))
 CONVERSATION_HISTORY_LIMIT = int(os.getenv("LLM_OPS_CONVERSATION_HISTORY_LIMIT", "18"))
@@ -120,6 +161,11 @@ SAVED_ANALYSIS_CONTEXT_LIMIT = int(os.getenv("LLM_OPS_SAVED_ANALYSIS_CONTEXT_LIM
 SAVED_ANALYSIS_CONTENT_CHAR_LIMIT = int(os.getenv("LLM_OPS_SAVED_ANALYSIS_CONTENT_CHAR_LIMIT", "24000"))
 SAVED_ANALYSIS_SOURCE_CHAR_LIMIT = int(os.getenv("LLM_OPS_SAVED_ANALYSIS_SOURCE_CHAR_LIMIT", "10000"))
 SAVED_ANALYSIS_PREVIEW_CHAR_LIMIT = int(os.getenv("LLM_OPS_SAVED_ANALYSIS_PREVIEW_CHAR_LIMIT", "180"))
+NMS_EVIDENCE_STORE_ENABLED = os.getenv("NMS_EVIDENCE_STORE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+NMS_EVIDENCE_STORE_MAX_FULL_CHARS = int(os.getenv("NMS_EVIDENCE_STORE_MAX_FULL_CHARS", "1200000"))
+NMS_EVIDENCE_STORE_CONTEXT_LIMIT = int(os.getenv("NMS_EVIDENCE_STORE_CONTEXT_LIMIT", "12000"))
+NMS_EVIDENCE_STORE_RECENT_LIMIT = int(os.getenv("NMS_EVIDENCE_STORE_RECENT_LIMIT", "5"))
+NMS_EVIDENCE_STORE_MAX_ITEMS_PER_SCOPE = int(os.getenv("NMS_EVIDENCE_STORE_MAX_ITEMS_PER_SCOPE", "80"))
 ATTACHMENT_MAX_COUNT = int(os.getenv("LLM_OPS_ATTACHMENT_MAX_COUNT", "5"))
 ATTACHMENT_MAX_FILE_BYTES = int(os.getenv("LLM_OPS_ATTACHMENT_MAX_FILE_BYTES", str(5 * 1024 * 1024)))
 ATTACHMENT_MAX_TOTAL_BYTES = int(os.getenv("LLM_OPS_ATTACHMENT_MAX_TOTAL_BYTES", str(12 * 1024 * 1024)))
@@ -127,6 +173,14 @@ ATTACHMENT_TEXT_CHAR_LIMIT = int(os.getenv("LLM_OPS_ATTACHMENT_TEXT_CHAR_LIMIT",
 ATTACHMENT_TOTAL_TEXT_CHAR_LIMIT = int(os.getenv("LLM_OPS_ATTACHMENT_TOTAL_TEXT_CHAR_LIMIT", "28000"))
 ATTACHMENT_CSV_ROW_LIMIT = int(os.getenv("LLM_OPS_ATTACHMENT_CSV_ROW_LIMIT", "120"))
 ATTACHMENT_TABLE_COLUMN_LIMIT = int(os.getenv("LLM_OPS_ATTACHMENT_TABLE_COLUMN_LIMIT", "20"))
+LARGE_LOG_DIR = Path(os.getenv("LLM_OPS_LARGE_LOG_DIR", "/mnt/llm-data/llm-ops/data/large-logs"))
+LARGE_LOG_MAX_FILE_BYTES = int(os.getenv("LLM_OPS_LARGE_LOG_MAX_FILE_BYTES", str(64 * 1024 * 1024)))
+LARGE_LOG_MAX_TOTAL_BYTES = int(os.getenv("LLM_OPS_LARGE_LOG_MAX_TOTAL_BYTES", str(128 * 1024 * 1024)))
+LARGE_LOG_CHUNK_CHARS = int(os.getenv("LLM_OPS_LARGE_LOG_CHUNK_CHARS", "12000"))
+LARGE_LOG_MAX_CHUNKS = int(os.getenv("LLM_OPS_LARGE_LOG_MAX_CHUNKS", "32"))
+LARGE_LOG_SUMMARY_CHAR_LIMIT = int(os.getenv("LLM_OPS_LARGE_LOG_SUMMARY_CHAR_LIMIT", "60000"))
+LARGE_LOG_ANALYSIS_TIMEOUT = int(os.getenv("LLM_OPS_LARGE_LOG_ANALYSIS_TIMEOUT_SECONDS", "1200"))
+LARGE_LOG_NUM_PREDICT = int(os.getenv("LLM_OPS_LARGE_LOG_NUM_PREDICT", "2200"))
 OPENAI_COMPAT_OBJECT = "chat.completion"
 
 
@@ -135,6 +189,15 @@ def utc_now() -> str:
 
 
 CONVERSATION_LOCK = threading.Lock()
+SGLANG_SWITCH_LOCK = threading.Lock()
+NMS_CONTEXT_CACHE_LOCK = threading.Lock()
+NMS_CONTEXT_CACHE: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+NMS_CONTEXT_CACHE_STATS = {
+    "hits": 0,
+    "misses": 0,
+    "stores": 0,
+    "evictions": 0,
+}
 
 
 def clip_text(value: Any, limit: int = CONVERSATION_MESSAGE_CHAR_LIMIT) -> str:
@@ -142,6 +205,82 @@ def clip_text(value: Any, limit: int = CONVERSATION_MESSAGE_CHAR_LIMIT) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit].rstrip()}\n\n...[truncated {len(text) - limit} chars]"
+
+
+def clip_middle_text(value: Any, limit: int = CONVERSATION_MESSAGE_CHAR_LIMIT) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    if limit <= 200:
+        return clip_text(text, limit)
+    head = max(80, int(limit * 0.62))
+    tail = max(80, limit - head - 80)
+    omitted = len(text) - head - tail
+    return f"{text[:head].rstrip()}\n\n...[middle truncated {omitted} chars]...\n\n{text[-tail:].lstrip()}"
+
+
+def parse_csv_values(value: str) -> list[str]:
+    items: list[str] = []
+    for raw_item in str(value or "").split(","):
+        item = raw_item.strip()
+        if item and item not in items:
+            items.append(item)
+    return items
+
+
+def parse_model_int_map(value: str) -> dict[str, int]:
+    parsed: dict[str, int] = {}
+    for raw_item in str(value or "").split(","):
+        if "=" not in raw_item:
+            continue
+        key, raw_value = raw_item.split("=", 1)
+        try:
+            parsed[key.strip()] = int(raw_value.strip())
+        except Exception:
+            continue
+    return parsed
+
+
+def parse_model_float_map(value: str) -> dict[str, float]:
+    parsed: dict[str, float] = {}
+    for raw_item in str(value or "").split(","):
+        if "=" not in raw_item:
+            continue
+        key, raw_value = raw_item.split("=", 1)
+        try:
+            parsed[key.strip()] = float(raw_value.strip())
+        except Exception:
+            continue
+    return parsed
+
+
+def parse_model_alias_map(value: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for raw_item in str(value or "").split(","):
+        if "=" not in raw_item:
+            continue
+        alias, target = raw_item.split("=", 1)
+        alias = alias.strip()
+        target = target.strip()
+        if alias and target:
+            parsed[alias] = target
+    return parsed
+
+
+SGLANG_AVAILABLE_MODELS = parse_csv_values(SGLANG_AVAILABLE_MODELS_RAW)
+if SGLANG_MODEL and SGLANG_MODEL not in SGLANG_AVAILABLE_MODELS:
+    SGLANG_AVAILABLE_MODELS.insert(0, SGLANG_MODEL)
+SGLANG_MODEL_CONTEXT_LENGTHS = parse_model_int_map(SGLANG_MODEL_CONTEXT_LENGTHS_RAW)
+SGLANG_MODEL_MEM_FRACTIONS = parse_model_float_map(SGLANG_MODEL_MEM_FRACTIONS_RAW)
+MODEL_ALIASES = parse_model_alias_map(MODEL_ALIASES_RAW)
+PUBLIC_MODEL_IDS = parse_csv_values(PUBLIC_MODEL_IDS_RAW)
+OLLAMA_CPU_ONLY_MODELS = set(parse_csv_values(OLLAMA_CPU_ONLY_MODELS_RAW))
+OLLAMA_KEEP_SGLANG_MODELS = set(parse_csv_values(OLLAMA_KEEP_SGLANG_MODELS_RAW))
+OLLAMA_MODEL_NUM_CTX = parse_model_int_map(OLLAMA_MODEL_NUM_CTX_RAW)
+OLLAMA_MODEL_NUM_GPU = parse_model_int_map(OLLAMA_MODEL_NUM_GPU_RAW)
+OLLAMA_MODEL_NUM_THREAD = parse_model_int_map(OLLAMA_MODEL_NUM_THREAD_RAW)
+OLLAMA_MODEL_NUM_PREDICT = parse_model_int_map(OLLAMA_MODEL_NUM_PREDICT_RAW)
+OLLAMA_DISABLE_THINK_MODELS = set(parse_csv_values(OLLAMA_DISABLE_THINK_MODELS_RAW))
 
 
 def sanitize_attachment_name(value: Any) -> str:
@@ -368,8 +507,12 @@ def extract_attachments_context(attachments: Any) -> dict[str, Any]:
         if total_bytes > ATTACHMENT_MAX_TOTAL_BYTES:
             errors.append(f"{name}: total attachment size exceeded")
             continue
+        suffix = attachment_extension(name)
         try:
-            text, method = extract_attachment_text(name, raw)
+            if suffix in {".txt", ".log", ".md", ".json", ".csv", ".tsv"}:
+                text, method = decode_text_bytes(raw), "raw-text"
+            else:
+                text, method = extract_attachment_text(name, raw)
         except Exception as exc:
             errors.append(f"{name}: {exc}")
             continue
@@ -393,6 +536,309 @@ def extract_attachments_context(attachments: Any) -> dict[str, Any]:
         combined = "첨부자료 추출본\n\n" + "\n\n".join(blocks)
         combined = clip_text(combined, ATTACHMENT_TOTAL_TEXT_CHAR_LIMIT)
     return {"text": combined, "items": items, "errors": errors, "total_bytes": total_bytes}
+
+
+IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+MAC_PATTERN = re.compile(r"\b[0-9A-Fa-f]{2}(?::|-){1}[0-9A-Fa-f]{2}(?::|-){1}[0-9A-Fa-f]{2}(?::|-){1}[0-9A-Fa-f]{2}(?::|-){1}[0-9A-Fa-f]{2}(?::|-){1}[0-9A-Fa-f]{2}\b")
+HOUR_PATTERN = re.compile(r"\b(?:20\d{2}[-/]\d{1,2}[-/]\d{1,2}[ T])?([01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?\b")
+LOG_KEYWORDS = {
+    "error": ("error", "err", "failed", "failure", "timeout", "unreachable", "down", "disconnect", "끊김", "실패", "오류"),
+    "warning": ("warn", "warning", "주의", "경고", "retry", "retransmit"),
+    "security": ("denied", "blocked", "attack", "malware", "virus", "ransom", "unauthorized", "login failed", "차단", "침입"),
+    "network": ("link down", "link up", "flap", "storm", "broadcast", "arp", "mdns", "packet loss", "latency", "snmp", "trap"),
+    "storage": ("backup", "snapshot", "hyper backup", "smb", "rename", "delete", "encrypt", "disk", "raid", "volume", "백업", "삭제", "이름 변경"),
+}
+
+
+def extract_large_log_context(attachments: Any) -> dict[str, Any]:
+    if not attachments:
+        raise ValueError("대용량 로그 분석에는 첨부파일이 필요합니다.")
+    if not isinstance(attachments, list):
+        raise ValueError("attachments must be a list")
+    if len(attachments) > ATTACHMENT_MAX_COUNT:
+        raise ValueError(f"too many attachments: max {ATTACHMENT_MAX_COUNT}")
+
+    request_id = uuid.uuid4().hex
+    request_dir = LARGE_LOG_DIR / datetime.now().strftime("%Y%m%d") / request_id
+    total_bytes = 0
+    combined_blocks: list[str] = []
+    items: list[dict[str, Any]] = []
+    errors: list[str] = []
+    request_dir.mkdir(parents=True, exist_ok=True)
+    for index, attachment in enumerate(attachments, start=1):
+        if not isinstance(attachment, dict):
+            errors.append(f"attachment #{index}: invalid payload")
+            continue
+        name = sanitize_attachment_name(attachment.get("name") or f"log-{index}.txt")
+        encoded = str(attachment.get("content_base64") or "").strip()
+        if not encoded:
+            errors.append(f"{name}: empty content")
+            continue
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except Exception:
+            errors.append(f"{name}: invalid base64")
+            continue
+        size = len(raw)
+        total_bytes += size
+        if size > LARGE_LOG_MAX_FILE_BYTES:
+            errors.append(f"{name}: file too large ({size} bytes)")
+            continue
+        if total_bytes > LARGE_LOG_MAX_TOTAL_BYTES:
+            errors.append(f"{name}: total large-log attachment size exceeded")
+            continue
+        stored_path = request_dir / name
+        stored_path.write_bytes(raw)
+        try:
+            text, method = extract_attachment_text(name, raw)
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+            continue
+        text = text.strip()
+        if not text:
+            errors.append(f"{name}: extracted text is empty")
+            continue
+        combined_blocks.append(f"[파일 {index}] {name} / size={size} bytes / method={method}\n{text}")
+        items.append(
+            {
+                "name": name,
+                "size": size,
+                "method": method,
+                "stored_path": str(stored_path),
+                "text_chars": len(text),
+                "preview": clip_text(text, 360),
+            }
+        )
+    if not items:
+        raise ValueError("; ".join(errors) or "no readable large-log attachments")
+    return {
+        "request_id": request_id,
+        "directory": str(request_dir),
+        "items": items,
+        "errors": errors,
+        "total_bytes": total_bytes,
+        "text": "\n\n".join(combined_blocks),
+    }
+
+
+def normalize_log_pattern(line: str) -> str:
+    value = line.strip()
+    value = IP_PATTERN.sub("<ip>", value)
+    value = MAC_PATTERN.sub("<mac>", value)
+    value = re.sub(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}[ T]\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?\b", "<ts>", value)
+    value = re.sub(r"\b\d+\b", "<num>", value)
+    value = re.sub(r"\s+", " ", value)
+    return clip_text(value, 220)
+
+
+def large_log_scan(text: str) -> dict[str, Any]:
+    keyword_counts = {key: 0 for key in LOG_KEYWORDS}
+    ips: Counter[str] = Counter()
+    macs: Counter[str] = Counter()
+    hours: Counter[str] = Counter()
+    repeated: Counter[str] = Counter()
+    examples: dict[str, list[str]] = {key: [] for key in LOG_KEYWORDS}
+    line_count = 0
+    non_empty_count = 0
+    for raw_line in text.splitlines():
+        line_count += 1
+        line = raw_line.strip()
+        if not line:
+            continue
+        non_empty_count += 1
+        lower = line.lower()
+        for key, keywords in LOG_KEYWORDS.items():
+            if any(keyword in lower for keyword in keywords):
+                keyword_counts[key] += 1
+                if len(examples[key]) < 5:
+                    examples[key].append(clip_text(line, 360))
+        for ip in IP_PATTERN.findall(line):
+            ips[ip] += 1
+        for mac in MAC_PATTERN.findall(line):
+            macs[mac.upper().replace("-", ":")] += 1
+        hour_match = HOUR_PATTERN.search(line)
+        if hour_match:
+            hours[f"{int(hour_match.group(1)):02d}:00"] += 1
+        pattern = normalize_log_pattern(line)
+        if pattern:
+            repeated[pattern] += 1
+    return {
+        "chars": len(text),
+        "line_count": line_count,
+        "non_empty_line_count": non_empty_count,
+        "keyword_counts": keyword_counts,
+        "top_ips": ips.most_common(20),
+        "top_macs": macs.most_common(20),
+        "top_hours": hours.most_common(24),
+        "top_repeated_patterns": repeated.most_common(20),
+        "examples": examples,
+    }
+
+
+def split_large_log_chunks(text: str) -> list[dict[str, Any]]:
+    chunk_size = max(2000, LARGE_LOG_CHUNK_CHARS)
+    chunks: list[dict[str, Any]] = []
+    start = 0
+    index = 1
+    while start < len(text):
+        end = min(len(text), start + chunk_size)
+        if end < len(text):
+            newline = text.rfind("\n", start + int(chunk_size * 0.55), end)
+            if newline > start:
+                end = newline + 1
+        chunk_text = text[start:end]
+        lower = chunk_text.lower()
+        score = sum(
+            lower.count(keyword)
+            for keywords in LOG_KEYWORDS.values()
+            for keyword in keywords
+        )
+        chunks.append({"index": index, "start": start, "end": end, "score": score, "text": chunk_text})
+        index += 1
+        start = end
+    if len(chunks) <= LARGE_LOG_MAX_CHUNKS:
+        return chunks
+    selected: dict[int, dict[str, Any]] = {0: chunks[0], len(chunks) - 1: chunks[-1]}
+    for chunk in sorted(chunks, key=lambda item: item["score"], reverse=True):
+        if len(selected) >= LARGE_LOG_MAX_CHUNKS:
+            break
+        selected[chunk["index"] - 1] = chunk
+    return [selected[key] for key in sorted(selected)]
+
+
+def render_large_log_scan(scan: dict[str, Any]) -> str:
+    repeated = "\n".join(
+        f"- {count}회: {pattern}"
+        for pattern, count in scan.get("top_repeated_patterns", [])[:10]
+    ) or "- 없음"
+    ips = ", ".join(f"{ip}({count})" for ip, count in scan.get("top_ips", [])[:10]) or "없음"
+    macs = ", ".join(f"{mac}({count})" for mac, count in scan.get("top_macs", [])[:10]) or "없음"
+    hours = ", ".join(f"{hour}({count})" for hour, count in scan.get("top_hours", [])[:12]) or "없음"
+    return (
+        "대용량 로그 1차 스캔\n"
+        f"- 문자수: {scan.get('chars')} / 라인수: {scan.get('line_count')} / 유효라인: {scan.get('non_empty_line_count')}\n"
+        f"- 키워드 카운트: {json.dumps(scan.get('keyword_counts') or {}, ensure_ascii=False)}\n"
+        f"- 상위 IP: {ips}\n"
+        f"- 상위 MAC: {macs}\n"
+        f"- 상위 시간대: {hours}\n"
+        f"- 반복 패턴:\n{repeated}"
+    )
+
+
+def run_large_log_chunk_analysis(
+    *,
+    text: str,
+    scan: dict[str, Any],
+    model: str,
+    question: str,
+    customer_name: str,
+    site_code: str,
+) -> dict[str, Any]:
+    chunks = split_large_log_chunks(text)
+    warnings: list[str] = []
+    chunk_summaries: list[dict[str, Any]] = []
+    scan_text = render_large_log_scan(scan)
+    for chunk in chunks:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "너는 네트워크/서버/NAS 운영 로그 분석가다. 로그에 없는 사실은 만들지 않는다. "
+                    "확정 사실, 추정, 누락 데이터를 분리하고 한국어로 답한다."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"고객사={customer_name or '-'}, site={site_code or '-'}\n"
+                    f"사용자 질문={question or '장애/보안/랜섬웨어/장비 이상 징후를 찾아라.'}\n\n"
+                    f"{scan_text}\n\n"
+                    f"아래는 전체 로그 중 선택된 조각 {chunk['index']}번이다. "
+                    "시간, 장비, IP, MAC, 반복 오류, 보안 징후, 네트워크 장애 징후를 근거 중심으로 요약해라.\n\n"
+                    f"{chunk['text']}"
+                ),
+            },
+        ]
+        chat = run_ollama_chat_messages(
+            messages,
+            model=model,
+            timeout=LARGE_LOG_ANALYSIS_TIMEOUT,
+            options={
+                "temperature": 0.05,
+                "top_p": 0.82,
+                "repeat_penalty": NMS_ANALYSIS_REPEAT_PENALTY,
+                "num_predict": 700,
+            },
+        )
+        if not chat.get("ok"):
+            warnings.append(f"조각 {chunk['index']}번 분석 실패: {result_error_text({'data': chat.get('raw')}) or 'unknown'}")
+        chunk_summaries.append(
+            {
+                "index": chunk["index"],
+                "start": chunk["start"],
+                "end": chunk["end"],
+                "score": chunk["score"],
+                "ok": bool(chat.get("ok")),
+                "elapsed_ms": chat.get("elapsed_ms"),
+                "summary": clip_text(chat.get("response") or json.dumps(chat.get("raw") or {}, ensure_ascii=False), 3000),
+            }
+        )
+    summary_text = "\n\n".join(
+        f"[조각 {item['index']} score={item['score']} chars={item['end'] - item['start']}]\n{item['summary']}"
+        for item in chunk_summaries
+    )
+    summary_text = clip_text(summary_text, LARGE_LOG_SUMMARY_CHAR_LIMIT)
+    final_messages = [
+        {
+            "role": "system",
+            "content": (
+                "너는 운영 장애 분석 책임자다. 대용량 로그 전체 스캔 결과와 조각별 요약만 근거로 최종 판단한다. "
+                "없는 데이터는 unknown/insufficient_data로 표시한다. 한국어로 답한다."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"고객사={customer_name or '-'}, site={site_code or '-'}\n"
+                f"사용자 질문={question or '대용량 로그를 근거로 장애/보안/랜섬웨어/장비 이상을 판단해줘.'}\n\n"
+                f"{scan_text}\n\n"
+                "조각별 LLM 분석 요약:\n"
+                f"{summary_text}\n\n"
+                "최종 출력 형식:\n"
+                "1. 종합 판정과 신뢰도\n"
+                "2. 확정 사실\n"
+                "3. 의심 원인 우선순위와 반박 근거\n"
+                "4. 보안/랜섬웨어/파일작업 위험\n"
+                "5. 네트워크 장애 징후\n"
+                "6. 바로 확인할 원격 작업\n"
+                "7. 현장 확인 작업\n"
+                "8. 추가로 필요한 데이터"
+            ),
+        },
+    ]
+    final = run_ollama_chat_messages(
+        final_messages,
+        model=model,
+        timeout=LARGE_LOG_ANALYSIS_TIMEOUT,
+        options={
+            "temperature": 0.06,
+            "top_p": 0.82,
+            "repeat_penalty": NMS_ANALYSIS_REPEAT_PENALTY,
+            "num_predict": LARGE_LOG_NUM_PREDICT,
+        },
+    )
+    return {
+        "ok": bool(final.get("ok")),
+        "model": final.get("model") or model,
+        "warnings": [*warnings, *(final.get("warnings") or [])],
+        "scan": scan,
+        "chunk_count_total": max(1, (len(text) + max(1, LARGE_LOG_CHUNK_CHARS) - 1) // max(1, LARGE_LOG_CHUNK_CHARS)),
+        "chunk_count_analyzed": len(chunks),
+        "chunks": chunk_summaries,
+        "response": final.get("response") or "",
+        "raw": final.get("raw"),
+        "elapsed_ms": sum(int(item.get("elapsed_ms") or 0) for item in chunk_summaries) + int(final.get("elapsed_ms") or 0),
+    }
 
 
 def init_conversation_store() -> None:
@@ -462,6 +908,39 @@ def init_conversation_store() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_saved_analyses_kind_updated
             ON saved_analyses(analysis_kind, updated_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nms_evidence_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                customer_name TEXT NOT NULL DEFAULT '',
+                site_codes TEXT NOT NULL DEFAULT '',
+                site_names TEXT NOT NULL DEFAULT '',
+                question TEXT NOT NULL DEFAULT '',
+                depth TEXT NOT NULL DEFAULT '',
+                hours INTEGER NOT NULL DEFAULT 0,
+                source_type TEXT NOT NULL DEFAULT 'network-evidence-pack',
+                evidence_version TEXT NOT NULL DEFAULT '',
+                digest TEXT NOT NULL DEFAULT '',
+                deterministic_brief TEXT NOT NULL DEFAULT '',
+                compact_context TEXT NOT NULL DEFAULT '',
+                full_context TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                meta_json TEXT NOT NULL DEFAULT '{}'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_nms_evidence_scope_created
+            ON nms_evidence_snapshots(customer_name, site_codes, created_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_nms_evidence_created
+            ON nms_evidence_snapshots(created_at DESC)
             """
         )
         conn.commit()
@@ -570,6 +1049,78 @@ def list_conversations(limit: int = 50) -> list[dict[str, Any]]:
         return items
 
 
+def list_autopilot_history(limit: int = 20) -> list[dict[str, Any]]:
+    init_conversation_store()
+    safe_limit = max(1, min(int(limit or 20), 100))
+    with CONVERSATION_LOCK, sqlite3.connect(CONVERSATION_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT c.*,
+                   (SELECT COUNT(*) FROM conversation_messages m WHERE m.conversation_id = c.id) AS message_count,
+                   (SELECT content FROM conversation_messages m
+                    WHERE m.conversation_id = c.id AND m.role = 'assistant'
+                    ORDER BY m.id DESC LIMIT 1) AS latest_assistant,
+                   (SELECT created_at FROM conversation_messages m
+                    WHERE m.conversation_id = c.id AND m.role = 'assistant'
+                    ORDER BY m.id DESC LIMIT 1) AS latest_assistant_at,
+                   (SELECT content FROM conversation_messages m
+                    WHERE m.conversation_id = c.id AND m.role = 'user'
+                    ORDER BY m.id DESC LIMIT 1) AS latest_user
+            FROM conversations c
+            WHERE c.id LIKE ?
+               OR c.meta_json LIKE ?
+               OR c.meta_json LIKE ?
+            ORDER BY c.updated_at DESC
+            LIMIT ?
+            """,
+            (
+                f"{NMS_AUTOPILOT_CONVERSATION_PREFIX}-%",
+                '%"source": "nms-autopilot"%',
+                '%"source":"nms-autopilot"%',
+                safe_limit,
+            ),
+        ).fetchall()
+        items = []
+        for row in rows:
+            item = serialize_conversation_row(row)
+            meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+            target = meta.get("target") if isinstance(meta.get("target"), dict) else {}
+            item["target"] = target
+            item["message_count"] = int(row["message_count"] or 0)
+            item["latest_user"] = clip_text(row["latest_user"] or "", 500)
+            item["latest_assistant_preview"] = clip_text(row["latest_assistant"] or "", 1200)
+            item["latest_assistant_at"] = row["latest_assistant_at"] or ""
+            items.append(item)
+        return items
+
+
+def conversation_store_counts() -> dict[str, int]:
+    init_conversation_store()
+    with CONVERSATION_LOCK, sqlite3.connect(CONVERSATION_DB_PATH) as conn:
+        conversation_count = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+        message_count = conn.execute("SELECT COUNT(*) FROM conversation_messages").fetchone()[0]
+        saved_count = conn.execute("SELECT COUNT(*) FROM saved_analyses").fetchone()[0]
+    return {
+        "conversations": int(conversation_count or 0),
+        "messages": int(message_count or 0),
+        "saved_analyses": int(saved_count or 0),
+    }
+
+
+def operations_dashboard_payload() -> dict[str, Any]:
+    return {
+        "success": True,
+        "generated_at": utc_now(),
+        "conversation_store": conversation_store_counts(),
+        "nms_context_cache": nms_context_cache_snapshot(),
+        "monitor": NMS_MONITOR.snapshot(),
+        "autopilot": NMS_AUTOPILOT.snapshot(),
+        "autopilot_history": list_autopilot_history(limit=20),
+        "saved_analyses": list_saved_analyses(limit=20, include_content=False),
+    }
+
+
 def load_conversation(conversation_id: str, limit: int = 100) -> dict[str, Any] | None:
     init_conversation_store()
     normalized_id = normalize_conversation_id(conversation_id)
@@ -621,6 +1172,8 @@ def append_conversation_messages(
     now = utc_now()
     rows = []
     for message in messages:
+        if not isinstance(message, dict):
+            continue
         role = str(message.get("role") or "").strip()
         content = clip_text(message.get("content") or "")
         if role not in {"user", "assistant", "tool"} or not content:
@@ -638,6 +1191,8 @@ def append_conversation_messages(
         )
         title = ""
         for message in messages:
+            if not isinstance(message, dict):
+                continue
             if str(message.get("role") or "") == "user":
                 title = clip_text(message.get("content") or "", CONVERSATION_TITLE_CHAR_LIMIT)
                 break
@@ -856,8 +1411,398 @@ def build_saved_analysis_context(customer_name: str, site_code: Any = "", limit:
     return "\n\n".join(lines)
 
 
+def json_dumps_compact(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def nms_evidence_scope_values(
+    context: dict[str, Any],
+    customer_name: str = "",
+    site_codes: Any = "",
+) -> tuple[str, str, str]:
+    matched = safe_dict(context.get("matched"))
+    requested = safe_dict(context.get("requested"))
+    customer = str(customer_name or requested.get("customer_name") or "").strip()
+    if not customer:
+        customer = ", ".join(str(name) for name in (matched.get("customer_names") or []) if name)
+    codes = normalize_site_codes(site_codes or requested.get("site_codes") or matched.get("site_codes") or [])
+    site_names = ", ".join(str(name) for name in (matched.get("site_names") or []) if name)
+    return clip_text(customer, 200), ",".join(codes), clip_text(site_names, 400)
+
+
+def serialize_nms_evidence_snapshot_row(row: sqlite3.Row, include_full: bool = False) -> dict[str, Any]:
+    try:
+        meta = json.loads(row["meta_json"] or "{}")
+    except Exception:
+        meta = {}
+    item = {
+        "id": int(row["id"]),
+        "customer_name": row["customer_name"] or "",
+        "site_codes": row["site_codes"] or "",
+        "site_names": row["site_names"] or "",
+        "question": row["question"] or "",
+        "depth": row["depth"] or "",
+        "hours": int(row["hours"] or 0),
+        "source_type": row["source_type"] or "",
+        "evidence_version": row["evidence_version"] or "",
+        "digest": row["digest"] or "",
+        "deterministic_brief": row["deterministic_brief"] or "",
+        "compact_context_preview": clip_text(row["compact_context"] or "", NMS_EVIDENCE_STORE_CONTEXT_LIMIT),
+        "full_context_chars": len(row["full_context"] or ""),
+        "compact_context_chars": len(row["compact_context"] or ""),
+        "created_at": row["created_at"],
+        "meta": meta,
+    }
+    if include_full:
+        item["compact_context"] = row["compact_context"] or ""
+        item["full_context"] = row["full_context"] or ""
+    return item
+
+
+def list_nms_evidence_snapshots(
+    customer_name: str = "",
+    site_codes: Any = "",
+    limit: int = NMS_EVIDENCE_STORE_RECENT_LIMIT,
+    include_full: bool = False,
+) -> list[dict[str, Any]]:
+    init_conversation_store()
+    safe_limit = max(1, min(int(limit or NMS_EVIDENCE_STORE_RECENT_LIMIT), 100))
+    normalized_customer = clip_text(str(customer_name or "").strip(), 200)
+    normalized_site_codes = ",".join(normalize_site_codes(site_codes))
+    conditions: list[str] = []
+    params: list[Any] = []
+    if normalized_customer:
+        conditions.append("customer_name = ?")
+        params.append(normalized_customer)
+    if normalized_site_codes:
+        conditions.append("(site_codes = '' OR site_codes = ?)")
+        params.append(normalized_site_codes)
+    query = "SELECT * FROM nms_evidence_snapshots"
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    params.append(safe_limit)
+    with CONVERSATION_LOCK, sqlite3.connect(CONVERSATION_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(query, params).fetchall()
+    return [serialize_nms_evidence_snapshot_row(row, include_full=include_full) for row in rows]
+
+
+def load_nms_evidence_snapshot(snapshot_id: Any, include_full: bool = True) -> dict[str, Any] | None:
+    try:
+        normalized_id = int(str(snapshot_id or "").strip())
+    except Exception:
+        return None
+    if normalized_id <= 0:
+        return None
+    init_conversation_store()
+    with CONVERSATION_LOCK, sqlite3.connect(CONVERSATION_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM nms_evidence_snapshots WHERE id = ?", (normalized_id,)).fetchone()
+    return serialize_nms_evidence_snapshot_row(row, include_full=include_full) if row else None
+
+
+def create_nms_evidence_snapshot(
+    context: dict[str, Any],
+    customer_name: str = "",
+    site_codes: Any = "",
+    question: str = "",
+    depth: str = "deep",
+    hours: Any = 0,
+) -> dict[str, Any] | None:
+    if not NMS_EVIDENCE_STORE_ENABLED or not context:
+        return None
+    init_conversation_store()
+    scoped_customer, scoped_site_codes, scoped_site_names = nms_evidence_scope_values(context, customer_name, site_codes)
+    compact_context = compact_nms_context_for_llm(context)
+    compact_text = clip_middle_text(json_dumps_compact(compact_context), NMS_ANALYSIS_CONTEXT_CHAR_LIMIT)
+    full_text = clip_middle_text(json_dumps_compact(context), NMS_EVIDENCE_STORE_MAX_FULL_CHARS)
+    digest = build_nms_evidence_digest(context)
+    deterministic_brief = build_nms_deterministic_brief(context)
+    source_type = "network-evidence-pack" if is_network_evidence_pack(context) else "nms-context"
+    evidence_version = str(context.get("evidence_pack_version") or context.get("version") or "")
+    context_hash = hashlib.sha256(full_text.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    now = utc_now()
+    meta = {
+        "context_hash": context_hash,
+        "requested": safe_dict(context.get("requested")),
+        "matched": safe_dict(context.get("matched")),
+        "compact_chars": len(compact_text),
+        "full_chars": len(full_text),
+    }
+    with CONVERSATION_LOCK, sqlite3.connect(CONVERSATION_DB_PATH) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO nms_evidence_snapshots (
+                customer_name, site_codes, site_names, question, depth, hours, source_type,
+                evidence_version, digest, deterministic_brief, compact_context, full_context,
+                created_at, meta_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                scoped_customer,
+                scoped_site_codes,
+                scoped_site_names,
+                clip_text(question, 500),
+                clip_text(depth, 40),
+                safe_int(hours, 0),
+                source_type,
+                clip_text(evidence_version, 80),
+                clip_text(digest, 12000),
+                clip_text(deterministic_brief, 18000),
+                compact_text,
+                full_text,
+                now,
+                json.dumps(meta, ensure_ascii=False),
+            ),
+        )
+        snapshot_id = cursor.lastrowid
+        conn.execute(
+            """
+            DELETE FROM nms_evidence_snapshots
+            WHERE customer_name = ?
+              AND site_codes = ?
+              AND id NOT IN (
+                  SELECT id
+                  FROM nms_evidence_snapshots
+                  WHERE customer_name = ? AND site_codes = ?
+                  ORDER BY created_at DESC, id DESC
+                  LIMIT ?
+              )
+            """,
+            (
+                scoped_customer,
+                scoped_site_codes,
+                scoped_customer,
+                scoped_site_codes,
+                max(1, NMS_EVIDENCE_STORE_MAX_ITEMS_PER_SCOPE),
+            ),
+        )
+        conn.commit()
+    loaded = load_nms_evidence_snapshot(snapshot_id, include_full=False)
+    return loaded or {
+        "id": snapshot_id,
+        "customer_name": scoped_customer,
+        "site_codes": scoped_site_codes,
+        "created_at": now,
+        "compact_context_chars": len(compact_text),
+        "full_context_chars": len(full_text),
+        "meta": meta,
+    }
+
+
+def build_nms_evidence_store_context(
+    customer_name: str = "",
+    site_codes: Any = "",
+    limit: int = NMS_EVIDENCE_STORE_RECENT_LIMIT,
+) -> str:
+    items = list_nms_evidence_snapshots(customer_name=customer_name, site_codes=site_codes, limit=limit)
+    if not items:
+        return ""
+    lines = [
+        "118 Evidence Store 참고",
+        "원본 evidence는 118 서버 SQLite에 저장되어 있으며, LLM 프롬프트에는 아래 요약/축약본만 포함한다.",
+    ]
+    for item in items:
+        scope = item.get("site_names") or item.get("site_codes") or "전체 현장"
+        lines.append(
+            f"[snapshot_id={item.get('id')}] created={item.get('created_at')} "
+            f"customer={item.get('customer_name') or '-'} scope={scope} "
+            f"source={item.get('source_type')} full_chars={item.get('full_context_chars')}"
+        )
+        if item.get("question"):
+            lines.append(f"요청: {clip_text(item.get('question'), 300)}")
+        lines.append(f"근거 요약:\n{clip_text(item.get('digest') or '', 1400)}")
+        if item.get("deterministic_brief"):
+            lines.append(f"규칙 기반 1차 브리핑:\n{clip_text(item.get('deterministic_brief') or '', 1600)}")
+    lines.append("저장 evidence와 현재 축약 JSON이 충돌하면 현재 요청의 timestamp와 최신 snapshot_id를 우선한다.")
+    return "\n\n".join(lines)
+
+
 def is_network_evidence_pack(context: dict[str, Any]) -> bool:
     return str((context or {}).get("evidence_pack_version") or "").startswith("network-evidence-pack")
+
+
+def limited_list(value: Any, limit: int) -> list[Any]:
+    if not isinstance(value, list):
+        return []
+    return value[: max(0, limit)]
+
+
+def compact_evidence_views(value: Any, row_limit: int = 20) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    compact: dict[str, Any] = {}
+    for name, payload in value.items():
+        if isinstance(payload, dict):
+            next_payload = dict(payload)
+            if isinstance(next_payload.get("rows"), list):
+                next_payload["rows"] = limited_list(next_payload.get("rows"), row_limit)
+            compact[str(name)] = next_payload
+        elif isinstance(payload, list):
+            compact[str(name)] = limited_list(payload, row_limit)
+        else:
+            compact[str(name)] = payload
+    return compact
+
+
+def compact_compressed_evidence(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    compact = dict(value)
+    aggregates = value.get("aggregates") if isinstance(value.get("aggregates"), dict) else {}
+    samples = value.get("representative_samples") if isinstance(value.get("representative_samples"), dict) else {}
+    compact["aggregates"] = {
+        "syslog_by_hour": limited_list(aggregates.get("syslog_by_hour"), 48),
+        "syslog_top_devices": limited_list(aggregates.get("syslog_top_devices"), 20),
+        "syslog_top_apps": limited_list(aggregates.get("syslog_top_apps"), 20),
+        "trap_top_oids": limited_list(aggregates.get("trap_top_oids"), 20),
+        "trap_top_sources": limited_list(aggregates.get("trap_top_sources"), 20),
+        "polling_top_metrics": limited_list(aggregates.get("polling_top_metrics"), 25),
+        "interface_latest_by_device": limited_list(aggregates.get("interface_latest_by_device"), 25),
+        "nas_docker_latest": limited_list(aggregates.get("nas_docker_latest"), 40),
+        "gateway_probe_latest": limited_list(aggregates.get("gateway_probe_latest"), 30),
+        "dns_probe_latest": limited_list(aggregates.get("dns_probe_latest"), 30),
+        "arp_latest": limited_list(aggregates.get("arp_latest"), 40),
+        "mac_latest": limited_list(aggregates.get("mac_latest"), 40),
+        "mdns_latest": limited_list(aggregates.get("mdns_latest"), 40),
+        "arp_top_talkers": limited_list(aggregates.get("arp_top_talkers"), 30),
+        "mdns_top_names": limited_list(aggregates.get("mdns_top_names"), 30),
+        "snmp_disk_latest": limited_list(aggregates.get("snmp_disk_latest"), 30),
+        "snmp_interface_errors": limited_list(aggregates.get("snmp_interface_errors"), 30),
+        "faulty_devices": limited_list(aggregates.get("faulty_devices"), 30),
+        "abnormal_traffic": limited_list(aggregates.get("abnormal_traffic"), 30),
+        "flood_summary": limited_list(aggregates.get("flood_summary"), 30),
+        "ingress_summary": limited_list(aggregates.get("ingress_summary"), 30),
+    }
+    compact["representative_samples"] = {
+        "syslog_patterns": limited_list(samples.get("syslog_patterns"), 25),
+        "syslog_dhcp_patterns": limited_list(samples.get("syslog_dhcp_patterns"), 25),
+        "syslog_stp_patterns": limited_list(samples.get("syslog_stp_patterns"), 25),
+        "polling_latest_by_device": limited_list(samples.get("polling_latest_by_device"), 25),
+    }
+    return compact
+
+
+def compact_network_evidence_for_llm(context: dict[str, Any]) -> dict[str, Any]:
+    analysis = context.get("deterministic_analysis") or {}
+    raw = context.get("raw_evidence") or {}
+    logs = raw.get("logs") or {}
+    traffic = raw.get("traffic") or {}
+    temporal = raw.get("temporal") or {}
+    compressed = compact_compressed_evidence(context.get("compressed_evidence") or {})
+    compact_analysis = {
+        "data_policy": analysis.get("data_policy") or context.get("source_policy") or {},
+        "coverage": analysis.get("coverage") or context.get("data_coverage") or {},
+        "top_signals": limited_list(analysis.get("top_signals"), 40),
+        "protocol_analysis": analysis.get("protocol_analysis") or {},
+        "timeline": limited_list(analysis.get("timeline"), 80),
+        "gaps": limited_list(analysis.get("gaps"), 30),
+        "root_cause_hypotheses": limited_list(analysis.get("root_cause_hypotheses"), 12),
+        "required_next_checks": limited_list(analysis.get("required_next_checks"), 30),
+    }
+    raw_samples = {
+        "sites": limited_list(raw.get("sites"), 20),
+        "devices": limited_list(raw.get("devices"), 80),
+        "traffic": {
+            "interface_count": traffic.get("interface_count", 0),
+            "interfaces": limited_list(traffic.get("interfaces"), 30),
+        },
+        "logs": {
+            "syslog_count": logs.get("syslog_count", 0),
+            "trap_count": logs.get("trap_count", 0),
+            "syslog": limited_list(logs.get("syslog"), 30),
+            "traps": limited_list(logs.get("traps"), 20),
+        },
+        "temporal": temporal,
+        "views": compact_evidence_views(raw.get("views") or {}, row_limit=15),
+    }
+    return {
+        "generated_at": context.get("generated_at"),
+        "evidence_pack_version": context.get("evidence_pack_version"),
+        "requested": context.get("requested") or {},
+        "matched": context.get("matched") or {},
+        "source_policy": context.get("source_policy") or {},
+        "data_coverage": context.get("data_coverage") or {},
+        "compressed_evidence": compressed,
+        "deterministic_analysis": compact_analysis,
+        "raw_evidence_policy": context.get("raw_evidence_policy") or {
+            "role": "sample_only",
+            "note": "raw_evidence는 제한 샘플이다. 기간 전체 판단은 compressed_evidence와 deterministic_analysis를 우선한다.",
+        },
+        "raw_evidence_samples": raw_samples,
+        "codex_command_set": context.get("codex_command_set") or {},
+        "llm_payload_policy": {
+            "rule": "33번 NMS가 기간 전체 원천 데이터를 SQL로 먼저 집계/압축했고, 118번 LLM은 이 압축 evidence와 대표 샘플을 분석한다.",
+            "do_not_do": [
+                "원문 전체가 없다는 이유로 없는 값을 상상하지 않는다.",
+                "raw_evidence_samples의 샘플 건수를 기간 전체 건수로 오해하지 않는다.",
+                "compressed_evidence.source_totals가 0이면 해당 소스는 관측되지 않음으로 표시한다.",
+            ],
+        },
+    }
+
+
+def compact_nms_context_for_llm(context: dict[str, Any]) -> dict[str, Any]:
+    if is_network_evidence_pack(context):
+        return compact_network_evidence_for_llm(context)
+    raw_logs = context.get("logs") or {}
+    raw_traffic = context.get("traffic") or {}
+    return {
+        "generated_at": context.get("generated_at"),
+        "requested": context.get("requested") or {},
+        "matched": context.get("matched") or {},
+        "sites": limited_list(context.get("sites"), 20),
+        "devices": limited_list(context.get("devices"), 80),
+        "traffic": {
+            "interface_count": raw_traffic.get("interface_count", 0),
+            "interfaces": limited_list(raw_traffic.get("interfaces"), 30),
+        },
+        "logs": {
+            "syslog_count": raw_logs.get("syslog_count", 0),
+            "trap_count": raw_logs.get("trap_count", 0),
+            "syslog": limited_list(raw_logs.get("syslog"), 30),
+            "traps": limited_list(raw_logs.get("traps"), 20),
+        },
+        "temporal": context.get("temporal") or {},
+        "llm_payload_policy": {
+            "rule": "NMS 원천 데이터 중 LLM에 필요한 샘플만 포함한다. 전체 건수는 count 필드를 우선한다.",
+        },
+    }
+
+
+def compact_messages_for_prompt_budget(messages: list[dict[str, str]], warnings: list[str]) -> list[dict[str, str]]:
+    total_chars = sum(len(str(message.get("content") or "")) for message in messages)
+    if total_chars <= LLM_OPS_MAX_PROMPT_CHARS:
+        return messages
+
+    compacted: list[dict[str, str]] = []
+    remaining = max(4000, LLM_OPS_MAX_PROMPT_CHARS)
+    for index, message in enumerate(messages):
+        role = str(message.get("role") or "user")
+        content = str(message.get("content") or "")
+        if not content:
+            continue
+        if role == "system":
+            limit = min(len(content), 12000, remaining)
+        elif index == len(messages) - 1:
+            limit = min(max(8000, int(remaining * 0.7)), LLM_OPS_MAX_SINGLE_MESSAGE_CHARS)
+        else:
+            limit = min(max(2500, int(remaining * 0.25)), LLM_OPS_MAX_SINGLE_MESSAGE_CHARS)
+        clipped = clip_middle_text(content, max(800, limit))
+        compacted.append({"role": role, "content": clipped})
+        remaining -= len(clipped)
+        if remaining <= 2000:
+            remaining = 2000
+
+    new_total = sum(len(message["content"]) for message in compacted)
+    if new_total < total_chars:
+        warnings.append(
+            f"프롬프트가 {total_chars:,}자로 너무 커서 {new_total:,}자로 압축했습니다. "
+            "NMS 분석은 /api/nms/analyze의 compressed evidence 경로 사용을 권장합니다."
+        )
+    return compacted
 
 
 def split_system_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
@@ -953,6 +1898,31 @@ def sanitize_korean_response(text: Any) -> str:
     return cleaned.strip().strip("\"'“”")
 
 
+def sanitize_uncomputed_cadence_claims(text: Any) -> str:
+    value = str(text or "")
+    cadence_claim_pattern = re.compile(
+        r"(?:\d+\s*분.*(?:간격|주기|단위|마다)|(?:간격|주기|단위|마다).*\d+\s*분)"
+    )
+    if not value or not cadence_claim_pattern.search(value):
+        return value
+
+    replacement = "반복 간격: 계산된 cadence/interval 값이 없어 단정하지 않음. 원문 타임스탬프 샘플만 근거로 반복 발생을 확인."
+    cleaned_lines: list[str] = []
+    for line in value.splitlines():
+        if cadence_claim_pattern.search(line):
+            indent = re.match(r"^\s*", line).group(0)
+            stripped = line.strip()
+            if stripped.startswith('"'):
+                suffix = "," if stripped.endswith(",") else ""
+                line = f'{indent}"{replacement}"{suffix}'
+            else:
+                line = f"{indent}- {replacement}"
+            if cleaned_lines and replacement in cleaned_lines[-1]:
+                continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines)
+
+
 def conversation_history_for_model(conversation_id: str, limit: int = CONVERSATION_HISTORY_LIMIT) -> list[dict[str, str]]:
     conversation = load_conversation(conversation_id, limit=limit)
     if not conversation:
@@ -996,11 +1966,15 @@ def parse_gpu_csv(output: str) -> list[dict[str, Any]]:
         if len(row) < 5:
             continue
         name, total, used, util, temp = [item.strip() for item in row[:5]]
+        total_mib = int(total.split()[0]) if total else None
+        used_mib = int(used.split()[0]) if used else None
+        used_percent = round((used_mib / total_mib) * 100, 1) if total_mib and used_mib is not None else None
         gpus.append(
             {
                 "name": name,
-                "memory_total_mib": int(total.split()[0]) if total else None,
-                "memory_used_mib": int(used.split()[0]) if used else None,
+                "memory_total_mib": total_mib,
+                "memory_used_mib": used_mib,
+                "memory_used_percent": used_percent,
                 "utilization_gpu_percent": int(util.split()[0]) if util else None,
                 "temperature_c": int(temp.split()[0]) if temp else None,
             }
@@ -1025,6 +1999,8 @@ def gpu_status() -> dict[str, Any]:
 
 
 def ollama_request(path: str, payload: dict[str, Any] | None = None, timeout: int | None = None) -> dict[str, Any]:
+    if not OLLAMA_ENABLED:
+        return {"ok": False, "status": 503, "data": {"error": "Ollama disabled"}}
     url = f"{OLLAMA_BASE_URL}{path}"
     data = None
     headers = {"Accept": "application/json"}
@@ -1079,8 +2055,123 @@ def http_json_request(
         return {"ok": False, "status": 0, "data": {"error": str(exc)}}
 
 
+def safe_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def result_data(result: dict[str, Any]) -> dict[str, Any]:
+    return safe_dict(result.get("data"))
+
+
+def result_message_content(result: dict[str, Any]) -> str:
+    data = result_data(result)
+    message = safe_dict(data.get("message"))
+    return str(message.get("content") or "")
+
+
+def result_error_text(result: dict[str, Any]) -> str:
+    data = result.get("data")
+    if isinstance(data, dict):
+        return str(data.get("error") or "")
+    return str(data or "")
+
+
+def read_runtime_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return values
+    except Exception:
+        return values
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            values[key] = value
+    return values
+
+
+def parse_runtime_int(value: Any) -> int | None:
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return None
+
+
+def parse_runtime_float(value: Any) -> float | None:
+    try:
+        return float(str(value).strip())
+    except Exception:
+        return None
+
+
+def sglang_runtime_config() -> dict[str, Any]:
+    env = read_runtime_env(SGLANG_RUNTIME_ENV_FILE)
+    mem_fraction = parse_runtime_float(env.get("SGLANG_MEM_FRACTION_STATIC"))
+    context_length = parse_runtime_int(env.get("SGLANG_CONTEXT_LENGTH"))
+    return {
+        "env_file": str(SGLANG_RUNTIME_ENV_FILE),
+        "model_path": env.get("SGLANG_MODEL_PATH") or SGLANG_MODEL,
+        "host": env.get("SGLANG_HOST") or "127.0.0.1",
+        "port": parse_runtime_int(env.get("SGLANG_PORT")) or 30000,
+        "context_length": context_length,
+        "mem_fraction_static": mem_fraction,
+        "target_vram_percent": round(mem_fraction * 100, 1) if mem_fraction is not None else None,
+        "attention_backend": env.get("SGLANG_ATTENTION_BACKEND") or "",
+        "sampling_backend": env.get("SGLANG_SAMPLING_BACKEND") or "",
+        "extra_args": env.get("SGLANG_EXTRA_ARGS") or "",
+    }
+
+
 def nms_headers() -> dict[str, str]:
     return {"X-NMS-ERP-Context-Token": NMS_CONTEXT_TOKEN} if NMS_CONTEXT_TOKEN else {}
+
+
+def nms_context_cache_snapshot() -> dict[str, Any]:
+    with NMS_CONTEXT_CACHE_LOCK:
+        return {
+            "enabled": NMS_CONTEXT_CACHE_ENABLED,
+            "ttl_seconds": NMS_CONTEXT_CACHE_TTL_SECONDS,
+            "max_items": NMS_CONTEXT_CACHE_MAX_ITEMS,
+            "items": len(NMS_CONTEXT_CACHE),
+            **NMS_CONTEXT_CACHE_STATS,
+        }
+
+
+def nms_context_cache_get(key: str) -> dict[str, Any] | None:
+    if not NMS_CONTEXT_CACHE_ENABLED or NMS_CONTEXT_CACHE_TTL_SECONDS <= 0:
+        return None
+    now = time.monotonic()
+    with NMS_CONTEXT_CACHE_LOCK:
+        cached = NMS_CONTEXT_CACHE.get(key)
+        if not cached:
+            NMS_CONTEXT_CACHE_STATS["misses"] += 1
+            return None
+        stored_at, value = cached
+        if now - stored_at > NMS_CONTEXT_CACHE_TTL_SECONDS:
+            NMS_CONTEXT_CACHE.pop(key, None)
+            NMS_CONTEXT_CACHE_STATS["misses"] += 1
+            return None
+        NMS_CONTEXT_CACHE.move_to_end(key)
+        NMS_CONTEXT_CACHE_STATS["hits"] += 1
+        return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def nms_context_cache_set(key: str, value: dict[str, Any]) -> None:
+    if not NMS_CONTEXT_CACHE_ENABLED or NMS_CONTEXT_CACHE_TTL_SECONDS <= 0 or NMS_CONTEXT_CACHE_MAX_ITEMS <= 0:
+        return
+    with NMS_CONTEXT_CACHE_LOCK:
+        NMS_CONTEXT_CACHE[key] = (time.monotonic(), json.loads(json.dumps(value, ensure_ascii=False)))
+        NMS_CONTEXT_CACHE.move_to_end(key)
+        NMS_CONTEXT_CACHE_STATS["stores"] += 1
+        while len(NMS_CONTEXT_CACHE) > NMS_CONTEXT_CACHE_MAX_ITEMS:
+            NMS_CONTEXT_CACHE.popitem(last=False)
+            NMS_CONTEXT_CACHE_STATS["evictions"] += 1
 
 
 def nms_get(path: str, params: dict[str, Any] | None = None, timeout: int | None = None) -> dict[str, Any]:
@@ -1090,10 +2181,26 @@ def nms_get(path: str, params: dict[str, Any] | None = None, timeout: int | None
     url = f"{NMS_CONTEXT_BASE_URL}{path}"
     if query:
         url = f"{url}?{query}"
-    return http_json_request(url, headers=nms_headers(), timeout=timeout or NMS_CONTEXT_TIMEOUT)
+    cache_key = f"{path}?{query}"
+    cached = nms_context_cache_get(cache_key)
+    if cached is not None:
+        return {"ok": True, "status": 200, "data": cached, "cached": True}
+    result = http_json_request(url, headers=nms_headers(), timeout=timeout or NMS_CONTEXT_TIMEOUT)
+    if result.get("ok") and isinstance(result.get("data"), dict):
+        nms_context_cache_set(cache_key, result["data"])
+    return result
 
 
 def ollama_status() -> dict[str, Any]:
+    if not OLLAMA_ENABLED:
+        return {
+            "base_url": OLLAMA_BASE_URL,
+            "reachable": False,
+            "service_active": None,
+            "models": [],
+            "running": [],
+            "error": {"error": "Ollama disabled"},
+        }
     tags = ollama_request("/api/tags", timeout=8)
     ps = ollama_request("/api/ps", timeout=8)
     service = run_command(["systemctl", "is-active", "ollama"], timeout=4)
@@ -1105,6 +2212,253 @@ def ollama_status() -> dict[str, Any]:
         "running": ps["data"].get("models", []) if ps["ok"] else [],
         "error": None if tags["ok"] else tags["data"],
     }
+
+
+def sglang_model_profile(model: str) -> dict[str, Any]:
+    name = str(model or SGLANG_MODEL).strip() or SGLANG_MODEL
+    return {
+        "context_length": SGLANG_MODEL_CONTEXT_LENGTHS.get(name),
+        "mem_fraction_static": SGLANG_MODEL_MEM_FRACTIONS.get(name),
+    }
+
+
+def sglang_model_entry(model: str | None = None) -> dict[str, Any]:
+    name = str(model or SGLANG_MODEL).strip() or SGLANG_MODEL
+    profile = sglang_model_profile(name)
+    return {
+        "name": name,
+        "model": name,
+        "provider": "sglang",
+        "details": {
+            "family": "SGLang",
+            "base_url": SGLANG_BASE_URL,
+            "context_length": profile.get("context_length"),
+            "mem_fraction_static": profile.get("mem_fraction_static"),
+        },
+    }
+
+
+def is_sglang_model(model: str) -> bool:
+    return SGLANG_ENABLED and str(model or "").strip() in set(SGLANG_AVAILABLE_MODELS)
+
+
+def resolve_model_alias(model: str) -> tuple[str, str]:
+    requested = str(model or "").strip()
+    return MODEL_ALIASES.get(requested, requested), requested
+
+
+def openai_model_ids() -> list[str]:
+    if PUBLIC_MODEL_IDS:
+        return list(dict.fromkeys(PUBLIC_MODEL_IDS))
+    ids: list[str] = []
+    for name in [*MODEL_ALIASES.keys(), DEFAULT_MODEL, FAST_MODEL, *SGLANG_AVAILABLE_MODELS]:
+        if name and name not in ids:
+            ids.append(name)
+    return ids
+
+
+def sglang_status() -> dict[str, Any]:
+    runtime_config = sglang_runtime_config()
+    configured_models = [sglang_model_entry(model) for model in SGLANG_AVAILABLE_MODELS]
+    if not SGLANG_ENABLED:
+        return {
+            "base_url": SGLANG_BASE_URL,
+            "reachable": False,
+            "models": [],
+            "running": [],
+            "runtime_config": runtime_config,
+            "error": {"error": "SGLang disabled"},
+        }
+    health = http_json_request(f"{SGLANG_BASE_URL}/health", timeout=4)
+    current_model = str(runtime_config.get("model_path") or SGLANG_MODEL)
+    running = [sglang_model_entry(current_model)] if health["ok"] else []
+    return {
+        "base_url": SGLANG_BASE_URL,
+        "reachable": health["ok"],
+        "models": configured_models,
+        "running": running,
+        "runtime_config": runtime_config,
+        "available_models": SGLANG_AVAILABLE_MODELS,
+        "error": None if health["ok"] else health["data"],
+    }
+
+
+def ensure_sglang_running(warnings: list[str] | None = None) -> dict[str, Any]:
+    status = sglang_status()
+    if status["reachable"] or not SGLANG_ENABLED:
+        return status
+    if not SGLANG_START_SCRIPT or not Path(SGLANG_START_SCRIPT).exists():
+        return status
+    started = run_command([SGLANG_START_SCRIPT], timeout=20)
+    if warnings is not None:
+        if started["ok"]:
+            warnings.append("SGLang 서버가 꺼져 있어 자동 시작했습니다.")
+        else:
+            warnings.append(f"SGLang 자동 시작 실패: {started['stderr'] or started['stdout']}")
+    deadline = time.monotonic() + max(SGLANG_START_WAIT_SECONDS, 1)
+    while time.monotonic() < deadline:
+        status = sglang_status()
+        if status["reachable"]:
+            return status
+        time.sleep(2)
+    return sglang_status()
+
+
+def write_sglang_runtime_env(updates: dict[str, Any]) -> None:
+    current_lines = SGLANG_RUNTIME_ENV_FILE.read_text(encoding="utf-8").splitlines() if SGLANG_RUNTIME_ENV_FILE.exists() else []
+    rendered: list[str] = []
+    remaining = {key: str(value) for key, value in updates.items() if value is not None and str(value) != ""}
+    for line in current_lines:
+        if "=" not in line or line.lstrip().startswith("#"):
+            rendered.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in remaining:
+            rendered.append(f"{key}={remaining.pop(key)}")
+        else:
+            rendered.append(line)
+    for key, value in remaining.items():
+        rendered.append(f"{key}={value}")
+    tmp_path = SGLANG_RUNTIME_ENV_FILE.with_name(f"{SGLANG_RUNTIME_ENV_FILE.name}.tmp-{uuid.uuid4().hex}")
+    tmp_path.write_text("\n".join(rendered).rstrip() + "\n", encoding="utf-8")
+    os.replace(tmp_path, SGLANG_RUNTIME_ENV_FILE)
+
+
+def restart_sglang_runtime(warnings: list[str] | None = None) -> dict[str, Any]:
+    main_pid = run_command(["systemctl", "show", "-p", "MainPID", "--value", "metro-sglang.service"], timeout=5)
+    pid = (main_pid.get("stdout") or "").strip()
+    if pid and pid != "0" and pid.isdigit():
+        stop = run_command(["kill", "-TERM", pid], timeout=10)
+    else:
+        stop = {"ok": False, "returncode": 1, "stdout": "", "stderr": "SGLang MainPID not found"}
+    if warnings is not None:
+        if stop["ok"]:
+            warnings.append("SGLang MainPID를 종료했고 systemd가 새 설정으로 재기동합니다.")
+        elif stop["returncode"] == 1:
+            warnings.append("실행 중인 SGLang 프로세스가 없어 새 기동 상태를 기다립니다.")
+        else:
+            warnings.append(f"SGLang 프로세스 종료 확인 필요: {stop['stderr'] or stop['stdout']}")
+    deadline = time.monotonic() + max(SGLANG_START_WAIT_SECONDS, 1)
+    while time.monotonic() < deadline:
+        status = sglang_status()
+        if status["reachable"]:
+            return status
+        time.sleep(3)
+    return sglang_status()
+
+
+def ensure_sglang_model(model: str, warnings: list[str] | None = None) -> dict[str, Any]:
+    requested = str(model or SGLANG_MODEL).strip() or SGLANG_MODEL
+    if not is_sglang_model(requested):
+        return sglang_status()
+    with SGLANG_SWITCH_LOCK:
+        runtime = sglang_runtime_config()
+        current_model = str(runtime.get("model_path") or SGLANG_MODEL)
+        status = sglang_status()
+        if current_model == requested and status.get("reachable"):
+            return status
+        if not SGLANG_AUTO_SWITCH_ENABLED:
+            if warnings is not None and current_model != requested:
+                warnings.append(
+                    f"요청 모델 {requested}은 설치 후보지만 현재 실행 모델은 {current_model}입니다. "
+                    "운영 안정성을 위해 요청 중 자동 재기동은 하지 않습니다."
+                )
+            if status.get("reachable"):
+                return status
+            return ensure_sglang_running(warnings)
+        profile = sglang_model_profile(requested)
+        updates: dict[str, Any] = {"SGLANG_MODEL_PATH": requested}
+        if profile.get("context_length"):
+            updates["SGLANG_CONTEXT_LENGTH"] = profile["context_length"]
+        if profile.get("mem_fraction_static") is not None:
+            updates["SGLANG_MEM_FRACTION_STATIC"] = profile["mem_fraction_static"]
+        write_sglang_runtime_env(updates)
+        if warnings is not None and current_model != requested:
+            warnings.append(
+                f"SGLang 모델을 {current_model}에서 {requested}(으)로 전환합니다. 최초 로딩은 수 분 걸릴 수 있습니다."
+            )
+        if status.get("reachable"):
+            return restart_sglang_runtime(warnings)
+        return ensure_sglang_running(warnings)
+
+
+def stop_sglang_if_running(warnings: list[str] | None = None) -> None:
+    if not SGLANG_ENABLED or not SGLANG_STOP_SCRIPT or not Path(SGLANG_STOP_SCRIPT).exists():
+        return
+    status = sglang_status()
+    if not status["reachable"]:
+        return
+    result = run_command([SGLANG_STOP_SCRIPT], timeout=20)
+    if warnings is not None:
+        if result["ok"]:
+            warnings.append("Ollama 모델 실행을 위해 SGLang 서버를 중지했습니다.")
+        else:
+            warnings.append(f"SGLang 중지 실패: {result['stderr'] or result['stdout']}")
+
+
+def sglang_chat_request(payload: dict[str, Any], timeout: int | None = None) -> dict[str, Any]:
+    result = http_json_request(
+        f"{SGLANG_BASE_URL}/v1/chat/completions",
+        payload,
+        timeout=timeout or SGLANG_REQUEST_TIMEOUT,
+    )
+    if not result["ok"]:
+        return result
+    choices = result_data(result).get("choices") or []
+    message = choices[0].get("message") if choices and isinstance(choices[0], dict) else {}
+    content = message.get("content") if isinstance(message, dict) else ""
+    return {
+        "ok": True,
+        "status": result["status"],
+        "data": {
+            "message": {"role": "assistant", "content": content or ""},
+            "runtime": "sglang",
+            "raw": result_data(result),
+        },
+    }
+
+
+def is_ollama_cpu_only_model(model: str) -> bool:
+    return str(model or "").strip() in OLLAMA_CPU_ONLY_MODELS
+
+
+def should_keep_sglang_for_ollama_model(model: str) -> bool:
+    name = str(model or "").strip()
+    return name in OLLAMA_KEEP_SGLANG_MODELS or name in OLLAMA_CPU_ONLY_MODELS
+
+
+def should_disable_ollama_think(model: str) -> bool:
+    return str(model or "").strip() in OLLAMA_DISABLE_THINK_MODELS
+
+
+def apply_ollama_model_policy(
+    model: str,
+    options: dict[str, Any] | None,
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    name = str(model or "").strip()
+    effective = dict(options or {})
+    if not is_ollama_cpu_only_model(name):
+        return effective
+
+    max_ctx = OLLAMA_MODEL_NUM_CTX.get(name)
+    if max_ctx:
+        requested_ctx = int(effective.get("num_ctx") or 0)
+        if requested_ctx <= 0 or requested_ctx > max_ctx:
+            effective["num_ctx"] = max_ctx
+    if name in OLLAMA_MODEL_NUM_GPU:
+        effective["num_gpu"] = OLLAMA_MODEL_NUM_GPU[name]
+    else:
+        effective["num_gpu"] = 0
+    if name in OLLAMA_MODEL_NUM_THREAD:
+        effective["num_thread"] = OLLAMA_MODEL_NUM_THREAD[name]
+    if "num_predict" not in effective and name in OLLAMA_MODEL_NUM_PREDICT:
+        effective["num_predict"] = OLLAMA_MODEL_NUM_PREDICT[name]
+    if warnings is not None:
+        warnings.append(
+            f"{name}은 정밀 Q4 CPU/RAM 모델로 실행합니다. GPU SGLang 모델은 유지하고 num_gpu={effective.get('num_gpu')}로 충돌을 피합니다."
+        )
+    return effective
 
 
 def build_analysis_prompt(body: dict[str, Any]) -> list[dict[str, str]]:
@@ -1159,11 +2513,14 @@ def build_nms_evidence_digest(context: dict[str, Any]) -> str:
         matched = context.get("matched") or {}
         coverage = context.get("data_coverage") or {}
         analysis = context.get("deterministic_analysis") or {}
+        compressed = context.get("compressed_evidence") or {}
+        source_totals = compressed.get("source_totals") or {}
+        aggregates = compressed.get("aggregates") or {}
         top_signals = analysis.get("top_signals") or []
         hypotheses = analysis.get("root_cause_hypotheses") or []
         gaps = analysis.get("gaps") or []
         lines = [
-            "- 분석 기준: network evidence pack v1. NMS 요약은 참고 자료이며 최종 근거는 고객사별 원천 데이터와 규칙 판정이다.",
+            f"- 분석 기준: {context.get('evidence_pack_version') or 'network evidence pack'}. NMS 요약은 참고 자료이며 최종 근거는 고객사별 원천 데이터 집계와 규칙 판정이다.",
             f"- 매칭 고객/현장: customers={matched.get('customer_count', 0)}, sites={matched.get('site_count', 0)}, site_codes={matched.get('site_codes') or []}",
             (
                 "- 데이터 커버리지: "
@@ -1172,6 +2529,13 @@ def build_nms_evidence_digest(context: dict[str, Any]) -> str:
                 f"trap={coverage.get('trap_sample_count', 0)}, "
                 f"interfaces={coverage.get('interface_sample_count', 0)}"
             ),
+            (
+                "- 기간 전체 SQL 집계: "
+                f"syslog={((source_totals.get('syslog') or {}).get('total') or 0)}, "
+                f"trap={((source_totals.get('snmp_trap') or {}).get('total') or 0)}, "
+                f"polling={((source_totals.get('polling') or {}).get('total') or 0)}, "
+                f"interface={((source_totals.get('interface_metric') or {}).get('total') or 0)}"
+            ),
             f"- 상위 이상 신호: {len(top_signals)}건",
         ]
         for item in top_signals[:8]:
@@ -1179,6 +2543,14 @@ def build_nms_evidence_digest(context: dict[str, Any]) -> str:
                 f"  · {item.get('severity')} / {item.get('source_type')} / {item.get('signal_type')} / "
                 f"{item.get('site_name') or '-'} / {item.get('device_name') or '-'} / {item.get('evidence') or '-'}"
             )
+        top_apps = aggregates.get("syslog_top_apps") or []
+        if top_apps:
+            lines.append("- Syslog 앱별 상위:")
+            for item in top_apps[:6]:
+                lines.append(
+                    f"  · {item.get('app_name')}: {item.get('count')}건 / "
+                    f"last={item.get('last_seen_at')} / {item.get('sample_device') or '-'}"
+                )
         if hypotheses:
             lines.append("- 원인 후보 초안:")
             for item in hypotheses[:5]:
@@ -1228,11 +2600,18 @@ def build_nms_deterministic_brief(context: dict[str, Any]) -> str:
         matched = context.get("matched") or {}
         coverage = context.get("data_coverage") or {}
         analysis = context.get("deterministic_analysis") or {}
+        compressed = context.get("compressed_evidence") or {}
+        source_totals = compressed.get("source_totals") or {}
+        aggregates = compressed.get("aggregates") or {}
         signals = analysis.get("top_signals") or []
         timeline = analysis.get("timeline") or []
         hypotheses = analysis.get("root_cause_hypotheses") or []
         next_checks = analysis.get("required_next_checks") or []
         gaps = analysis.get("gaps") or []
+        protocol = analysis.get("protocol_analysis") or {}
+        dhcp = protocol.get("dhcp") or {}
+        dhcp_summary = dhcp.get("summary") or {}
+        dhcp_macs = dhcp.get("macs") or []
         lines = [
             "검증된 고객사별 네트워크 Evidence Pack",
             f"- 대상: {', '.join(matched.get('customer_names') or []) or requested.get('customer_name') or '전체'} / site_codes={matched.get('site_codes') or []}",
@@ -1244,13 +2623,40 @@ def build_nms_deterministic_brief(context: dict[str, Any]) -> str:
                 f"syslog={coverage.get('syslog_sample_count', 0)}, trap={coverage.get('trap_sample_count', 0)}, "
                 f"interface={coverage.get('interface_sample_count', 0)}"
             ),
+            (
+                "- 기간 전체 SQL 집계: "
+                f"syslog={((source_totals.get('syslog') or {}).get('total') or 0)}, "
+                f"trap={((source_totals.get('snmp_trap') or {}).get('total') or 0)}, "
+                f"polling={((source_totals.get('polling') or {}).get('total') or 0)}, "
+                f"interface={((source_totals.get('interface_metric') or {}).get('total') or 0)}"
+            ),
         ]
+        if dhcp_summary.get("total_events"):
+            lines.append(
+                "- DHCP 분석: "
+                f"risk={dhcp_summary.get('risk_level')}, events={dhcp_summary.get('total_events')}, "
+                f"unique_macs={dhcp_summary.get('unique_mac_count')}, note={dhcp_summary.get('note')}"
+            )
+            for item in dhcp_macs[:5]:
+                lines.append(
+                    f"  · MAC {item.get('mac')}: count={item.get('count')}, "
+                    f"events={item.get('event_types')}, interfaces={item.get('interfaces')}, vlans={item.get('vlans')}"
+                )
         if signals:
             lines.append("- 상위 이상 신호:")
             for item in signals[:10]:
                 lines.append(
                     f"  · {item.get('severity')} / {item.get('source_type')} / {item.get('signal_type')} / "
                     f"{item.get('site_name') or '-'} / {item.get('device_name') or '-'} / {item.get('evidence') or '-'}"
+                )
+        top_apps = aggregates.get("syslog_top_apps") or []
+        if top_apps:
+            lines.append("- Syslog 앱별 상위:")
+            for item in top_apps[:8]:
+                lines.append(
+                    f"  · {item.get('app_name')}: {item.get('count')}건 / "
+                    f"last={item.get('last_seen_at')} / {item.get('sample_device') or '-'} / "
+                    f"{clip_text(item.get('sample_message') or '', 90)}"
                 )
         if hypotheses:
             lines.append("- 원인 후보 초안:")
@@ -1354,19 +2760,39 @@ def build_nms_analysis_prompt(
     depth: str = "deep",
     saved_context: str = "",
     attachments_context: str = "",
+    stored_evidence_context: str = "",
+    evidence_snapshot: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     requested = context.get("requested") or {}
     matched = context.get("matched") or {}
     customer_names = ", ".join(matched.get("customer_names") or []) or requested.get("customer_name") or "전체"
     evidence_digest = build_nms_evidence_digest(context)
-    data_text = json.dumps(context, ensure_ascii=False, indent=2)[:NMS_ANALYSIS_CONTEXT_CHAR_LIMIT]
+    llm_context = compact_nms_context_for_llm(context)
+    evidence_limit = min(NMS_ANALYSIS_CONTEXT_CHAR_LIMIT, NMS_LLM_EVIDENCE_CHAR_LIMIT)
+    if evidence_snapshot:
+        evidence_limit = min(evidence_limit, NMS_EVIDENCE_STORE_CONTEXT_LIMIT)
+    data_text = clip_text(json.dumps(llm_context, ensure_ascii=False, indent=2), evidence_limit)
+    snapshot_notice = ""
+    if evidence_snapshot:
+        snapshot_notice = (
+            "이번 원본 evidence는 118 서버 Evidence Store에 저장했다. "
+            f"snapshot_id={evidence_snapshot.get('id')}, "
+            f"full_chars={evidence_snapshot.get('full_context_chars')}, "
+            f"compact_chars={evidence_snapshot.get('compact_context_chars')}. "
+            "LLM 프롬프트에는 요약/축약 JSON만 포함되므로, 없는 원문 값을 상상하지 말고 "
+            "필요하면 snapshot_id 기준으로 추가 조회가 필요하다고 표시한다."
+        )
     if is_network_evidence_pack(context):
         command_set = context.get("codex_command_set") or {}
         system_prompt = (
             "너는 Codex가 지휘하는 고객사별 네트워크 장애 분석 보고 담당자다. "
-            "NMS 결과를 결론으로 추론하지 말고, network evidence pack의 원천 데이터, 규칙 기반 신호, "
-            "타임라인, 누락 데이터, Codex 명령 셋을 근거로만 판단한다. "
+            "NMS 결과를 결론으로 추론하지 말고, network evidence pack의 기간 전체 SQL 압축집계, "
+            "대표 원천 샘플, 규칙 기반 신호, 타임라인, 누락 데이터, Codex 명령 셋을 근거로만 판단한다. "
             "확정 사실/추정/누락 데이터/원격 확인/현장 확인/고객 보고 문안을 반드시 분리한다. "
+            "raw_evidence_samples는 샘플이고 기간 전체 판단은 compressed_evidence를 우선한다. "
+            "DHCP DISCOVER/OFFER 반복만으로 보안 위협이나 CRITICAL을 단정하지 않는다. "
+            "반복 간격/주기는 JSON에 계산된 cadence/interval 값이 있을 때만 말하고, 없으면 정확한 타임스탬프 샘플만 인용한다. "
+            "traffic.interfaces 또는 interface_metrics가 없으면 트래픽 정상/비정상을 단정하지 않는다. "
             "JSON에 없는 내용은 단정하지 말고 '자료 없음'으로 표시한다."
         )
         command_prompt = command_set.get("recommended_prompt") or ""
@@ -1377,21 +2803,26 @@ def build_nms_analysis_prompt(
             "NMS 원천 데이터를 근거로 장애 징후를 판단한다. 답변은 빠른 추측이 아니라 근거 기반 "
             "심층 분석이어야 한다. JSON에 없는 내용은 단정하지 말고 '자료 없음' 또는 '추정'으로 "
             "표시해라. 같은 말을 반복하지 말고, 시간/장비/수치/로그 문구를 근거로 인용해라. "
-            "숫자가 0인 항목은 반드시 '관측되지 않음'으로 해석하고, 없는 데이터를 만들어내지 마라."
+            "숫자가 0인 항목은 반드시 '관측되지 않음'으로 해석하고, 없는 데이터를 만들어내지 마라. "
+            "반복 간격/주기는 JSON에 계산된 cadence/interval 값이 있을 때만 말하고, 없으면 정확한 타임스탬프 샘플만 인용해라. "
+            "DHCP DISCOVER/OFFER 반복만으로 보안 위협을 단정하지 말고, 데이터 없음과 정상을 분리해라."
         )
         command_prompt = ""
     user_prompt = (
         f"분석 대상: {customer_names}\n"
         f"분석 모드: {depth}\n"
         f"요청: {question or '최근 관제 데이터 기준으로 이상 징후와 조치 우선순위를 판단해줘.'}\n\n"
+        f"{f'Evidence Store 안내:\\n{snapshot_notice}\\n\\n' if snapshot_notice else ''}"
         f"우선 적용할 근거 요약:\n{evidence_digest}\n\n"
         f"{f'Codex 표준 명령:\\n{command_prompt}\\n\\n' if command_prompt else ''}"
         f"{f'이전 저장 분석 참고:\\n{saved_context}\\n\\n' if saved_context else ''}"
+        f"{f'저장 Evidence Snapshot 참고:\\n{stored_evidence_context}\\n\\n' if stored_evidence_context else ''}"
         f"{f'외부 첨부자료 추출본:\\n{attachments_context}\\n\\n' if attachments_context else ''}"
-        f"Evidence Pack JSON:\n{data_text}\n\n"
+        f"LLM Safe Evidence Pack JSON:\n{data_text}\n\n"
         "분석 지침:\n"
         "- NMS 요약을 그대로 결론으로 쓰지 말고 고객사별 evidence pack의 원천 근거와 규칙 판정을 먼저 검증한다.\n"
-        "- 먼저 전체 JSON을 훑고, matched/sites/devices/traffic/logs/temporal 순서로 근거를 정리한다.\n"
+        "- 먼저 compressed_evidence.source_totals와 aggregates를 보고 기간 전체 경향을 잡은 뒤 raw_evidence_samples로 대표 로그를 검증한다.\n"
+        "- raw_evidence_samples의 샘플 건수를 전체 건수로 해석하지 않는다.\n"
         "- 이전 저장 분석은 참고용이다. 현재 로그/트래픽과 다른 부분이 있으면 차이를 먼저 설명한다.\n"
         "- 첨부자료가 있으면 현재 NMS 원천값과 모순되는지 먼저 비교하고, 첨부자료의 수치/표/문장을 근거에 함께 반영한다.\n"
         "- temporal.off_hours와 temporal.nas_file_risk가 있으면 새벽 이벤트, 랜섬웨어성 파일 작업, 반복 시간대를 별도 판단한다.\n"
@@ -1399,6 +2830,10 @@ def build_nms_analysis_prompt(
         "- temporal.nas_ransomware_findings가 있으면 33번 NMS 규칙 엔진의 1차 판정이다. LLM 판단보다 우선 근거로 삼고, severity/title/count/sample_message를 그대로 인용해라.\n"
         "- Grafana 화면은 NMS DB를 시각화한 것이므로, Grafana 값이라고 표현할 때도 JSON의 traffic/logs/temporal 원천값을 근거로 삼는다.\n"
         "- temporal.top_event_hours는 이벤트 발생 시간 분포다. traffic.interfaces가 없으면 트래픽량으로 해석하지 마라.\n"
+        "- deterministic_analysis.protocol_analysis.dhcp가 있으면 동일 MAC 반복, 다수 MAC 폭증, 다중 OFFER, gateway/DNS 변경, MAC 이동 후보를 분리해 해석한다.\n"
+        "- 반복 간격, 주기, '몇 분 간격' 표현은 JSON에 cadence/interval로 계산된 값이 있을 때만 사용한다. 샘플 타임스탬프만 있으면 '반복 발생'으로 쓰고, 원문 시각을 그대로 인용한다.\n"
+        "- DHCP DISCOVER/OFFER 반복만 있으면 정상 IP 할당 과정일 수 있으므로 INFO 또는 낮은 신뢰도 주의로만 본다. 다중 DHCP OFFER, gateway/DNS 변경, MAC 다중 VLAN/포트 이동, STP/포트 flap/트래픽 오류가 동반될 때만 위험도를 올린다.\n"
+        "- SNMP Trap 0건은 장비 장애 근거가 아니라 trap 관측 없음이다. 데이터 없음과 정상은 다르다.\n"
         "- nas_file_risk.file_operation_count가 0이면 새벽 파일 삭제/이동/이름변경은 관측되지 않았다고 써라. 전체 시간대 파일작업 여부는 nas_file_activity로 따로 판단해라.\n"
         "- 이벤트가 많아도 정상 주기 작업일 가능성과 장애/보안 이벤트 가능성을 분리한다.\n"
         "- 근거가 부족하면 어떤 데이터가 더 필요한지 명확히 적는다.\n\n"
@@ -1422,31 +2857,80 @@ def run_ollama_chat_messages(
     options: dict[str, Any] | None = None,
     keep_alive: str = KEEP_ALIVE,
 ) -> dict[str, Any]:
+    if not is_sglang_model(model) and not OLLAMA_ENABLED and SGLANG_ENABLED:
+        model = DEFAULT_MODEL if is_sglang_model(DEFAULT_MODEL) else SGLANG_MODEL
+    if is_sglang_model(model):
+        warnings: list[str] = []
+        messages = compact_messages_for_prompt_budget(messages, warnings)
+        unload_ok = unload_running_models_except(model, warnings)
+        if not unload_ok:
+            return {
+                "ok": False,
+                "status": HTTPStatus.BAD_GATEWAY,
+                "model": model,
+                "elapsed_ms": 0,
+                "response": "",
+                "warnings": warnings,
+                "raw": {"error": "ollama model is still running; SGLang start was skipped to avoid VRAM conflict"},
+            }
+        ensure_sglang_model(model, warnings)
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+        }
+        if options:
+            if "temperature" in options:
+                payload["temperature"] = options["temperature"]
+            if "top_p" in options:
+                payload["top_p"] = options["top_p"]
+            if "num_predict" in options:
+                payload["max_tokens"] = options["num_predict"]
+        started = time.monotonic()
+        result = sglang_chat_request(payload, timeout=timeout)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        response_text = result_message_content(result)
+        return {
+            "ok": result["ok"],
+            "status": result["status"],
+            "model": model,
+            "elapsed_ms": elapsed_ms,
+            "response": response_text or "",
+            "warnings": warnings,
+            "raw": result.get("data") if isinstance(result.get("data"), dict) else {"error": result.get("data")},
+        }
+
+    warnings: list[str] = []
+    options = apply_ollama_model_policy(model, options, warnings)
     payload = {
         "model": model,
         "messages": messages,
         "stream": False,
         "keep_alive": keep_alive,
     }
+    if should_disable_ollama_think(model):
+        payload["think"] = False
     if options:
         payload["options"] = options
     started = time.monotonic()
     result = ollama_request("/api/chat", payload, timeout=timeout)
     elapsed_ms = int((time.monotonic() - started) * 1000)
-    response_text = (result.get("data") or {}).get("message", {}).get("content")
+    response_text = result_message_content(result)
     return {
         "ok": result["ok"],
         "status": result["status"],
         "model": model,
         "elapsed_ms": elapsed_ms,
         "response": response_text or "",
-        "raw": result.get("data") or {},
+        "warnings": warnings,
+        "raw": result.get("data") if isinstance(result.get("data"), dict) else {"error": result.get("data")},
     }
 
 
 def model_summary(model: dict[str, Any]) -> dict[str, Any]:
     return {
         "name": model.get("name") or model.get("model"),
+        "provider": model.get("provider") or "ollama",
         "size": model.get("size"),
         "modified_at": model.get("modified_at"),
         "details": model.get("details"),
@@ -1455,32 +2939,66 @@ def model_summary(model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def unload_running_models_except(target_model: str, warnings: list[str] | None = None) -> None:
+def unload_running_models_except(target_model: str, warnings: list[str] | None = None) -> bool:
     if not MODEL_AUTO_UNLOAD_BEFORE_SWITCH_ENABLED:
-        return
+        return True
     target = str(target_model or "").strip()
     if not target:
-        return
+        return True
+    if not OLLAMA_ENABLED:
+        return True
+    target_is_sglang = is_sglang_model(target)
     status = ollama_status()
     running = [
         str(item.get("name") or item.get("model") or "").strip()
         for item in status.get("running") or []
         if str(item.get("name") or item.get("model") or "").strip()
     ]
+    if target_is_sglang:
+        sglang = sglang_status()
+        current_sglang_model = str((sglang.get("runtime_config") or {}).get("model_path") or SGLANG_MODEL)
+        if sglang.get("reachable") and current_sglang_model == target:
+            if running and warnings is not None:
+                warnings.append("SGLang 대상 모델이 이미 실행 중이라 잔류 Ollama 모델 언로드 대기를 건너뜁니다.")
+            return True
+    if not target_is_sglang and not should_keep_sglang_for_ollama_model(target):
+        stop_sglang_if_running(warnings)
     for running_model in running:
         if running_model == target:
             continue
-        result = ollama_request(
-            "/api/generate",
-            {"model": running_model, "prompt": "", "stream": False, "keep_alive": 0},
-            timeout=MODEL_SWITCH_UNLOAD_TIMEOUT,
-        )
+        if shutil.which("ollama"):
+            stop_cmd = run_command(["ollama", "stop", running_model], timeout=MODEL_SWITCH_UNLOAD_TIMEOUT)
+            result = {
+                "ok": stop_cmd["ok"],
+                "data": {"error": stop_cmd["stderr"] or stop_cmd["stdout"]},
+            }
+        else:
+            result = ollama_request(
+                "/api/generate",
+                {"model": running_model, "prompt": "", "stream": False, "keep_alive": 0},
+                timeout=MODEL_SWITCH_UNLOAD_TIMEOUT,
+            )
         if warnings is not None:
             if result.get("ok"):
                 warnings.append(f"선택 모델 전환을 위해 기존 실행 모델 {running_model}을 언로드했습니다.")
             else:
-                error = (result.get("data") or {}).get("error") or "알 수 없는 오류"
+                error = result_error_text(result) or "알 수 없는 오류"
                 warnings.append(f"기존 실행 모델 {running_model} 언로드 실패: {error}")
+    if target_is_sglang and running:
+        deadline = time.monotonic() + max(MODEL_SWITCH_UNLOAD_TIMEOUT, 1)
+        while time.monotonic() < deadline:
+            still_running = [
+                str(item.get("name") or item.get("model") or "").strip()
+                for item in ollama_status().get("running") or []
+                if str(item.get("name") or item.get("model") or "").strip()
+            ]
+            if not still_running:
+                return True
+            time.sleep(2)
+        if warnings is not None:
+            warnings.append("Ollama 모델이 제한시간 안에 완전히 내려가지 않아 SGLang 시작을 보류했습니다.")
+        return False
+    return True
 
 
 class NmsMonitor:
@@ -1736,7 +3254,28 @@ class NmsAutopilot:
             "장애/보안/랜섬웨어/장비 불량 가능성과 다음 조치를 실무적으로 판단해라."
         )
         saved_context = build_saved_analysis_context(customer_name, site_codes, limit=SAVED_ANALYSIS_CONTEXT_LIMIT)
-        prompt_messages = build_nms_analysis_prompt(context, question, "deep", saved_context)
+        evidence_snapshot = create_nms_evidence_snapshot(
+            context,
+            customer_name=customer_name,
+            site_codes=site_codes,
+            question=question,
+            depth="autopilot",
+            hours=NMS_AUTOPILOT_WINDOW_HOURS,
+        )
+        stored_evidence_context = build_nms_evidence_store_context(
+            customer_name,
+            site_codes,
+            limit=NMS_EVIDENCE_STORE_RECENT_LIMIT,
+        )
+        prompt_messages = build_nms_analysis_prompt(
+            context,
+            question,
+            "deep",
+            saved_context,
+            "",
+            stored_evidence_context,
+            evidence_snapshot,
+        )
         system_messages, current_messages = split_system_messages(prompt_messages)
         history = conversation_history_for_model(conversation["id"], limit=min(CONVERSATION_HISTORY_LIMIT, 8))
         messages = [*system_messages, *history, *current_messages]
@@ -1753,7 +3292,10 @@ class NmsAutopilot:
                 "num_predict": NMS_AUTOPILOT_NUM_PREDICT,
             },
         )
-        response_text = chat.get("response") or ""
+        raw_response_text = chat.get("response") or ""
+        response_text = sanitize_uncomputed_cadence_claims(raw_response_text)
+        if response_text != raw_response_text:
+            chat.setdefault("warnings", []).append("계산 근거 없는 반복 간격/주기 표현을 제거했습니다.")
         if response_text:
             response_text = f"{deterministic_brief}\n\n---\n\nLLM 심층 분석\n{response_text}"
         append_conversation_messages(
@@ -1764,6 +3306,7 @@ class NmsAutopilot:
                     "content": (
                         f"NMS 자동분석: customer={customer_name or '-'}, site_codes={site_codes or '-'}, "
                         f"score={target.get('score')}, events={target.get('recent_event_count')}, "
+                        f"snapshot_id={(evidence_snapshot or {}).get('id') or '-'}, "
                         f"degraded={target.get('degraded_device_count')}, down={target.get('down_device_count')}"
                     ),
                 },
@@ -1780,6 +3323,7 @@ class NmsAutopilot:
             "conversation_id": conversation["id"],
             "elapsed_ms": chat.get("elapsed_ms"),
             "response_chars": len(response_text),
+            "evidence_snapshot_id": (evidence_snapshot or {}).get("id"),
             "error": None if chat.get("ok") else chat.get("raw"),
             "time": utc_now(),
         }
@@ -1832,33 +3376,97 @@ class Handler(BaseHTTPRequestHandler):
                     "auth_required": bool(API_TOKEN),
                     "default_model": DEFAULT_MODEL,
                     "fast_model": FAST_MODEL,
+                    "public_models": PUBLIC_MODEL_IDS,
                     "model_fallback_enabled": MODEL_FALLBACK_ENABLED,
                     "model_running_switch_guard_enabled": MODEL_RUNNING_SWITCH_GUARD_ENABLED,
                     "model_auto_unload_before_switch_enabled": MODEL_AUTO_UNLOAD_BEFORE_SWITCH_ENABLED,
+                    "ollama_enabled": OLLAMA_ENABLED,
                     "ollama_base_url": OLLAMA_BASE_URL,
+                    "sglang_enabled": SGLANG_ENABLED,
+                    "sglang_base_url": SGLANG_BASE_URL,
+                    "sglang_model": SGLANG_MODEL,
+                    "sglang_available_models": SGLANG_AVAILABLE_MODELS,
+                    "model_aliases": MODEL_ALIASES,
+                    "sglang_auto_switch_enabled": SGLANG_AUTO_SWITCH_ENABLED,
+                    "sglang_runtime": sglang_runtime_config(),
+                    "ollama_cpu_only_models": sorted(OLLAMA_CPU_ONLY_MODELS),
+                    "ollama_keep_sglang_models": sorted(OLLAMA_KEEP_SGLANG_MODELS),
+                    "ollama_disable_think_models": sorted(OLLAMA_DISABLE_THINK_MODELS),
+                    "default_num_ctx": LLM_OPS_DEFAULT_NUM_CTX,
+                    "attachment_limits": {
+                        "max_count": ATTACHMENT_MAX_COUNT,
+                        "max_file_bytes": ATTACHMENT_MAX_FILE_BYTES,
+                        "max_total_bytes": ATTACHMENT_MAX_TOTAL_BYTES,
+                    },
+                    "large_log_limits": {
+                        "directory": str(LARGE_LOG_DIR),
+                        "max_file_bytes": LARGE_LOG_MAX_FILE_BYTES,
+                        "max_total_bytes": LARGE_LOG_MAX_TOTAL_BYTES,
+                        "chunk_chars": LARGE_LOG_CHUNK_CHARS,
+                        "max_chunks": LARGE_LOG_MAX_CHUNKS,
+                    },
                     "nms_context_configured": bool(NMS_CONTEXT_BASE_URL and NMS_CONTEXT_TOKEN),
                     "nms_context_base_url": NMS_CONTEXT_BASE_URL,
+                    "nms_context_cache": nms_context_cache_snapshot(),
+                    "nms_evidence_store": {
+                        "enabled": NMS_EVIDENCE_STORE_ENABLED,
+                        "database": str(CONVERSATION_DB_PATH),
+                        "prompt_context_limit": NMS_EVIDENCE_STORE_CONTEXT_LIMIT,
+                        "max_full_chars": NMS_EVIDENCE_STORE_MAX_FULL_CHARS,
+                        "recent_limit": NMS_EVIDENCE_STORE_RECENT_LIMIT,
+                    },
                     "keep_alive": KEEP_ALIVE,
                     "time": utc_now(),
                 }
             )
         if route == "/api/health":
             return self.json_response(self.health_payload())
-        if route == "/api/models":
-            status = ollama_status()
+        if route == "/api/sglang/runtime":
+            if not self.authorized():
+                return self.json_response({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
             return self.json_response(
                 {
-                    "ok": status["reachable"],
-                    "models": [model_summary(m) for m in status["models"]],
-                    "running": [model_summary(m) for m in status["running"]],
+                    "ok": True,
+                    "runtime": sglang_runtime_config(),
+                    "status": sglang_status(),
+                    "gpu": gpu_status(),
+                    "time": utc_now(),
+                }
+            )
+        if route == "/api/models":
+            status = ollama_status()
+            sglang = sglang_status()
+            models = [model_summary(m) for m in status["models"]]
+            if SGLANG_ENABLED:
+                public_sglang_ids = PUBLIC_MODEL_IDS if PUBLIC_MODEL_IDS else [
+                    str(item.get("name") or item.get("model") or "").strip()
+                    for item in sglang["models"]
+                    if str(item.get("name") or item.get("model") or "").strip()
+                ]
+                models.extend(model_summary(sglang_model_entry(model_id)) for model_id in public_sglang_ids)
+            running = [model_summary(m) for m in status["running"]]
+            running.extend(model_summary(m) for m in sglang["running"])
+            return self.json_response(
+                {
+                    "ok": status["reachable"] or sglang["reachable"],
+                    "models": models,
+                    "running": running,
                     "default_model": DEFAULT_MODEL,
                     "fast_model": FAST_MODEL,
+                    "sglang_model": SGLANG_MODEL if SGLANG_ENABLED else "",
+                    "sglang_available_models": SGLANG_AVAILABLE_MODELS if SGLANG_ENABLED else [],
+                    "public_models": PUBLIC_MODEL_IDS,
+                    "model_aliases": MODEL_ALIASES,
+                    "sglang_auto_switch_enabled": SGLANG_AUTO_SWITCH_ENABLED,
+                    "precision_models": sorted(OLLAMA_CPU_ONLY_MODELS),
+                    "ollama_cpu_only_models": sorted(OLLAMA_CPU_ONLY_MODELS),
+                    "ollama_disable_think_models": sorted(OLLAMA_DISABLE_THINK_MODELS),
                     "model_fallback_enabled": MODEL_FALLBACK_ENABLED,
                     "model_running_switch_guard_enabled": MODEL_RUNNING_SWITCH_GUARD_ENABLED,
                     "model_auto_unload_before_switch_enabled": MODEL_AUTO_UNLOAD_BEFORE_SWITCH_ENABLED,
-                    "error": status["error"],
+                    "error": None if status["reachable"] or sglang["reachable"] else {"ollama": status["error"], "sglang": sglang["error"]},
                 },
-                HTTPStatus.OK if status["reachable"] else HTTPStatus.BAD_GATEWAY,
+                HTTPStatus.OK if status["reachable"] or sglang["reachable"] else HTTPStatus.BAD_GATEWAY,
             )
         if route == "/api/conversations" or route.startswith("/api/conversations/"):
             if not self.authorized():
@@ -1931,6 +3539,8 @@ class Handler(BaseHTTPRequestHandler):
             )
             body["messages"] = build_analysis_prompt(body)
             return self.handle_chat(body)
+        if route == "/api/large-log/analyze":
+            return self.handle_large_log_analyze(body)
         if route == "/api/nms/analyze":
             return self.handle_nms_analyze(body)
         if route == "/api/nms/autopilot/run":
@@ -2026,8 +3636,78 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return None
 
+    def handle_large_log_analyze(self, body: dict[str, Any]) -> None:
+        try:
+            context = extract_large_log_context(body.get("attachments") or [])
+        except ValueError as exc:
+            return self.json_response({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
+        requested_model = str(body.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+        model, warnings = self.resolve_model_for_request(requested_model)
+        text = str(context.get("text") or "")
+        scan = large_log_scan(text)
+        question = str(body.get("question") or body.get("prompt") or "").strip()
+        customer_name = str(body.get("customer_name") or body.get("customer") or "").strip()
+        site_code = str(body.get("site_code") or body.get("site_codes") or "").strip()
+        analysis = run_large_log_chunk_analysis(
+            text=text,
+            scan=scan,
+            model=model,
+            question=question,
+            customer_name=customer_name,
+            site_code=site_code,
+        )
+        all_warnings = [*warnings, *(context.get("errors") or []), *(analysis.get("warnings") or [])]
+        conversation_id = normalize_conversation_id(body.get("conversation_id") or body.get("thread_id") or "")
+        remember = bool(conversation_id or body.get("remember") or body.get("persist"))
+        if remember and analysis.get("response"):
+            conversation = ensure_conversation(
+                conversation_id,
+                title=clip_text(question or f"{customer_name or '대용량 로그'} 분석", CONVERSATION_TITLE_CHAR_LIMIT),
+                meta={"source": body.get("source") or "large-log-analysis", "customer_name": customer_name, "site_code": site_code},
+            )
+            conversation_id = conversation["id"]
+            append_conversation_messages(
+                conversation_id,
+                [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"대용량 로그 분석 요청: customer={customer_name or '-'}, site={site_code or '-'}, "
+                            f"files={len(context.get('items') or [])}, chars={scan.get('chars')}, question={question or '-'}"
+                        ),
+                    },
+                    {"role": "assistant", "content": str(analysis.get("response") or "")},
+                ],
+                meta={"model": analysis.get("model") or model, "source": "large-log-analysis", "elapsed_ms": analysis.get("elapsed_ms")},
+            )
+        payload = {
+            "ok": bool(analysis.get("ok")),
+            "model": analysis.get("model") or model,
+            "model_requested": requested_model,
+            "warnings": all_warnings,
+            "conversation_id": conversation_id or None,
+            "stored": {
+                "request_id": context.get("request_id"),
+                "directory": context.get("directory"),
+                "items": context.get("items"),
+                "total_bytes": context.get("total_bytes"),
+            },
+            "scan": analysis.get("scan"),
+            "chunk_count_total": analysis.get("chunk_count_total"),
+            "chunk_count_analyzed": analysis.get("chunk_count_analyzed"),
+            "chunks": analysis.get("chunks"),
+            "response": analysis.get("response"),
+            "raw": analysis.get("raw"),
+            "elapsed_ms": analysis.get("elapsed_ms"),
+            "gpu": gpu_status(),
+            "time": utc_now(),
+        }
+        return self.json_response(payload, HTTPStatus.OK if analysis.get("ok") else HTTPStatus.BAD_GATEWAY)
+
     def handle_openai_models(self) -> None:
         status = ollama_status()
+        sglang = sglang_status()
         data = []
         for model in status.get("models") or []:
             model_name = model.get("name") or model.get("model")
@@ -2039,7 +3719,16 @@ class Handler(BaseHTTPRequestHandler):
                 "created": 0,
                 "owned_by": "metro-llm-ops",
             })
-        return self.json_response({"object": "list", "data": data}, HTTPStatus.OK if status["reachable"] else HTTPStatus.BAD_GATEWAY)
+        if SGLANG_ENABLED:
+            for model_name in openai_model_ids():
+                data.append({
+                    "id": model_name,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "metro-sglang",
+                })
+        ok = status["reachable"] or sglang["reachable"] or bool(data)
+        return self.json_response({"object": "list", "data": data}, HTTPStatus.OK if ok else HTTPStatus.BAD_GATEWAY)
 
     def handle_nms_get(self, route: str, requestUrl: urllib.parse.ParseResult) -> None:
         params = urllib.parse.parse_qs(requestUrl.query)
@@ -2074,6 +3763,28 @@ class Handler(BaseHTTPRequestHandler):
                     timeout=max(NMS_CONTEXT_TIMEOUT, 30),
                 )
             return self.json_response(result["data"], HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY)
+        if route == "/api/nms/evidence-snapshots":
+            items = list_nms_evidence_snapshots(
+                customer_name=first("customer_name"),
+                site_codes=first("site_codes"),
+                limit=int(first("limit", str(NMS_EVIDENCE_STORE_RECENT_LIMIT)) or str(NMS_EVIDENCE_STORE_RECENT_LIMIT)),
+                include_full=first("include_full").lower() in {"1", "true", "yes", "on"},
+            )
+            return self.json_response({"success": True, "count": len(items), "items": items})
+        if route.startswith("/api/nms/evidence-snapshots/"):
+            snapshot_id = route.rsplit("/", 1)[-1]
+            item = load_nms_evidence_snapshot(
+                snapshot_id,
+                include_full=first("include_full", "true").lower() not in {"0", "false", "no", "off"},
+            )
+            if not item:
+                return self.json_response({"error": "evidence snapshot not found"}, HTTPStatus.NOT_FOUND)
+            return self.json_response({"success": True, "item": item})
+        if route == "/api/nms/operations":
+            return self.json_response(operations_dashboard_payload())
+        if route == "/api/nms/autopilot/history":
+            limit = int(first("limit", "20") or "20")
+            return self.json_response({"success": True, "items": list_autopilot_history(limit=limit)})
         if route == "/api/nms/monitor/status":
             return self.json_response(NMS_MONITOR.snapshot())
         if route == "/api/nms/monitor/refresh":
@@ -2109,8 +3820,24 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
     def resolve_model_for_request(self, requested_model: str) -> tuple[str, list[str]]:
-        model = str(requested_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+        requested = str(requested_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+        model, alias = resolve_model_alias(requested)
         warnings: list[str] = []
+        if alias and alias != model:
+            warnings.append(f"요청 모델 별칭 {alias}을 현재 운영 모델 {model}로 연결했습니다.")
+        if is_sglang_model(model):
+            current_model = str(sglang_runtime_config().get("model_path") or SGLANG_MODEL)
+            if current_model != model and not SGLANG_AUTO_SWITCH_ENABLED:
+                fallback = current_model if is_sglang_model(current_model) else SGLANG_MODEL
+                warnings.append(
+                    f"요청 모델 {model}은 현재 실행 중이 아니어서 활성 SGLang 모델 {fallback}로 실행했습니다."
+                )
+                return fallback, warnings
+            return model, warnings
+        if SGLANG_ENABLED and not OLLAMA_ENABLED:
+            fallback = DEFAULT_MODEL if is_sglang_model(DEFAULT_MODEL) else SGLANG_MODEL
+            warnings.append(f"Ollama가 비활성화되어 요청 모델 {model} 대신 SGLang 모델 {fallback}로 실행했습니다.")
+            return fallback, warnings
         if not MODEL_FALLBACK_ENABLED or not DEFAULT_MODEL or model == DEFAULT_MODEL:
             return model, warnings
 
@@ -2175,33 +3902,89 @@ class Handler(BaseHTTPRequestHandler):
             system_messages, non_system_current = split_system_messages(current_messages)
             messages = [*system_messages, *history, *non_system_current]
 
+        messages = compact_messages_for_prompt_budget(messages, warnings)
         options = body.get("options") if isinstance(body.get("options"), dict) else {}
         for key in ("temperature", "num_ctx", "num_predict", "top_p", "top_k", "repeat_penalty"):
             if key in body:
                 options[key] = body[key]
-        payload = {
-            "model": model,
-            "messages": messages,
-            "stream": False,
-            "keep_alive": body.get("keep_alive", KEEP_ALIVE),
-        }
-        if options:
-            payload["options"] = options
-        unload_running_models_except(model, warnings)
+        if "num_ctx" not in options and LLM_OPS_DEFAULT_NUM_CTX > 0:
+            options["num_ctx"] = LLM_OPS_DEFAULT_NUM_CTX
+        runtime = "sglang" if is_sglang_model(model) else "ollama"
+        if runtime == "ollama":
+            options = apply_ollama_model_policy(model, options, warnings)
+        if runtime == "sglang":
+            payload = {
+                "model": model,
+                "messages": messages,
+                "stream": False,
+            }
+            if "temperature" in options:
+                payload["temperature"] = options["temperature"]
+            if "top_p" in options:
+                payload["top_p"] = options["top_p"]
+            max_tokens = options.get("num_predict") or body.get("max_tokens") or body.get("max_completion_tokens")
+            if max_tokens:
+                payload["max_tokens"] = max_tokens
+        else:
+            payload = {
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                "keep_alive": body.get("keep_alive", KEEP_ALIVE),
+            }
+            if should_disable_ollama_think(model):
+                payload["think"] = False
+            if options:
+                payload["options"] = options
+        unload_ok = unload_running_models_except(model, warnings)
+        if runtime == "sglang" and not unload_ok:
+            return {
+                "ok": False,
+                "model": model,
+                "model_requested": requested_model,
+                "warnings": warnings,
+                "error": "ollama model is still running; SGLang start was skipped to avoid VRAM conflict",
+                "gpu": gpu_status(),
+                "time": utc_now(),
+            }, HTTPStatus.BAD_GATEWAY
+        if runtime == "sglang":
+            ensure_sglang_model(model, warnings)
         started = time.monotonic()
-        result = ollama_request("/api/chat", payload, timeout=int(body.get("timeout") or REQUEST_TIMEOUT))
+        if runtime == "sglang":
+            result = sglang_chat_request(payload, timeout=int(body.get("timeout") or SGLANG_REQUEST_TIMEOUT))
+        else:
+            result = ollama_request("/api/chat", payload, timeout=int(body.get("timeout") or REQUEST_TIMEOUT))
         elapsed_ms = int((time.monotonic() - started) * 1000)
-        response_text = (result["data"].get("message") or {}).get("content")
+        response_text = result_message_content(result)
         if not result["ok"] and MODEL_FALLBACK_ENABLED and model != DEFAULT_MODEL and DEFAULT_MODEL:
-            error_text = str((result.get("data") or {}).get("error") or "")
-            if "timed out" in error_text.lower():
-                warnings.append(f"{model} 응답이 timeout되어 {DEFAULT_MODEL}로 한 번 더 실행했습니다.")
+            error_text = result_error_text(result)
+            if runtime == "sglang" or "timed out" in error_text.lower():
+                warnings.append(f"{model} 응답 실패로 {DEFAULT_MODEL}로 한 번 더 실행했습니다.")
                 model = DEFAULT_MODEL
+                runtime = "sglang" if is_sglang_model(model) else "ollama"
                 payload["model"] = model
+                if runtime == "sglang":
+                    payload.pop("keep_alive", None)
+                    payload.pop("options", None)
+                    if "temperature" in options:
+                        payload["temperature"] = options["temperature"]
+                    if "top_p" in options:
+                        payload["top_p"] = options["top_p"]
+                    max_tokens = options.get("num_predict") or body.get("max_tokens") or body.get("max_completion_tokens")
+                    if max_tokens:
+                        payload["max_tokens"] = max_tokens
+                    ensure_sglang_model(model, warnings)
+                else:
+                    payload["keep_alive"] = body.get("keep_alive", KEEP_ALIVE)
+                    payload["options"] = options
                 started = time.monotonic()
-                result = ollama_request("/api/chat", payload, timeout=int(body.get("timeout") or REQUEST_TIMEOUT))
+                unload_running_models_except(model, warnings)
+                if runtime == "sglang":
+                    result = sglang_chat_request(payload, timeout=int(body.get("timeout") or SGLANG_REQUEST_TIMEOUT))
+                else:
+                    result = ollama_request("/api/chat", payload, timeout=int(body.get("timeout") or REQUEST_TIMEOUT))
                 elapsed_ms = int((time.monotonic() - started) * 1000)
-                response_text = (result["data"].get("message") or {}).get("content")
+                response_text = result_message_content(result)
         if result["ok"] and should_retry_korean_response(messages, response_text):
             warnings.append("응답이 한국어가 아닌 언어로 시작되어 한국어 재작성 요청을 자동 실행했습니다.")
             retry_payload = dict(payload)
@@ -2217,9 +4000,12 @@ class Handler(BaseHTTPRequestHandler):
                 {"role": "user", "content": "위 요청에 대한 최종 답변을 한국어로만 다시 작성해라."},
             ]
             started = time.monotonic()
-            retry_result = ollama_request("/api/chat", retry_payload, timeout=int(body.get("timeout") or REQUEST_TIMEOUT))
+            if runtime == "sglang":
+                retry_result = sglang_chat_request(retry_payload, timeout=int(body.get("timeout") or SGLANG_REQUEST_TIMEOUT))
+            else:
+                retry_result = ollama_request("/api/chat", retry_payload, timeout=int(body.get("timeout") or REQUEST_TIMEOUT))
             retry_elapsed_ms = int((time.monotonic() - started) * 1000)
-            retry_response = (retry_result.get("data") or {}).get("message", {}).get("content")
+            retry_response = result_message_content(retry_result)
             if retry_result.get("ok") and retry_response:
                 result = retry_result
                 elapsed_ms += retry_elapsed_ms
@@ -2228,12 +4014,19 @@ class Handler(BaseHTTPRequestHandler):
         if sanitized_response != (response_text or ""):
             warnings.append("최종 응답 앞부분의 비한국어 문장을 제거하고 한국어 답변만 표시했습니다.")
             response_text = sanitized_response
-            if isinstance(result.get("data", {}).get("message"), dict):
+            if isinstance(result.get("data"), dict) and isinstance(result["data"].get("message"), dict):
                 result["data"]["message"]["content"] = response_text
+        if body.get("forbid_uncomputed_cadence"):
+            cadence_sanitized_response = sanitize_uncomputed_cadence_claims(response_text)
+            if cadence_sanitized_response != (response_text or ""):
+                warnings.append("계산 근거 없는 반복 간격/주기 표현을 제거했습니다.")
+                response_text = cadence_sanitized_response
+                if isinstance(result.get("data"), dict) and isinstance(result["data"].get("message"), dict):
+                    result["data"]["message"]["content"] = response_text
         prepend_report = str(body.get("prepend_report") or "").strip()
         if prepend_report and response_text:
             response_text = f"{prepend_report}\n\n---\n\nLLM 심층 분석\n{response_text}"
-            if isinstance(result["data"].get("message"), dict):
+            if isinstance(result.get("data"), dict) and isinstance(result["data"].get("message"), dict):
                 result["data"]["message"]["content"] = response_text
         if remember and conversation_id and response_text:
             store_messages = body.get("conversation_store_messages")
@@ -2261,9 +4054,9 @@ class Handler(BaseHTTPRequestHandler):
             "warnings": warnings,
             "elapsed_ms": elapsed_ms,
             "conversation_id": conversation_id or None,
-            "message": result["data"].get("message"),
+            "message": result_data(result).get("message"),
             "response": response_text,
-            "raw": result["data"],
+            "raw": result.get("data") if isinstance(result.get("data"), dict) else {"error": result.get("data")},
             "gpu": gpu_status(),
             "attachment_summary": (body.get("attachment_context") or {}).get("items") if isinstance(body.get("attachment_context"), dict) else [],
             "attachment_errors": (body.get("attachment_context") or {}).get("errors") if isinstance(body.get("attachment_context"), dict) else [],
@@ -2307,6 +4100,9 @@ class Handler(BaseHTTPRequestHandler):
                 "total_tokens": 0,
             },
             "conversation_id": payload.get("conversation_id"),
+            "warnings": payload.get("warnings") or [],
+            "model_requested": payload.get("model_requested"),
+            "gpu": payload.get("gpu"),
         }
         return self.json_response(completion, HTTPStatus.OK)
 
@@ -2341,32 +4137,53 @@ class Handler(BaseHTTPRequestHandler):
                 timeout=max(NMS_CONTEXT_TIMEOUT, 30),
             )
         if not result["ok"]:
-            return self.json_response(result["data"], HTTPStatus.BAD_GATEWAY)
+            return self.json_response(result_data(result) or {"error": result.get("data")}, HTTPStatus.BAD_GATEWAY)
 
+        context_data = result_data(result)
+        matched = safe_dict(context_data.get("matched"))
+        effective_customer_name = customer_name or ", ".join((matched.get("customer_names") or []))
+        effective_site_codes = site_codes or ",".join(str(value) for value in (matched.get("site_codes") or []) if value)
+        evidence_snapshot = create_nms_evidence_snapshot(
+            context_data,
+            customer_name=effective_customer_name,
+            site_codes=effective_site_codes,
+            question=str(body.get("question") or ""),
+            depth=depth,
+            hours=context_params.get("hours") or default_hours,
+        )
+        stored_evidence_context = build_nms_evidence_store_context(
+            effective_customer_name,
+            effective_site_codes,
+            limit=int(body.get("evidence_snapshot_limit") or NMS_EVIDENCE_STORE_RECENT_LIMIT),
+        )
         attachment_context = self.prepare_attachment_context(body)
         if attachment_context is None:
             return
         body["attachment_context"] = attachment_context
         body["attachments_context"] = attachment_context.get("text") or ""
         body["saved_analysis_context"] = build_saved_analysis_context(
-            customer_name or ", ".join((result["data"].get("matched") or {}).get("customer_names") or []),
-            site_codes,
+            effective_customer_name,
+            effective_site_codes,
             limit=int(body.get("saved_analysis_limit") or SAVED_ANALYSIS_CONTEXT_LIMIT),
         )
         body["messages"] = build_nms_analysis_prompt(
-            result["data"],
+            context_data,
             str(body.get("question") or ""),
             depth,
             str(body.get("saved_analysis_context") or ""),
             str(body.get("attachments_context") or ""),
+            stored_evidence_context,
+            evidence_snapshot,
         )
-        body["prepend_report"] = build_nms_deterministic_brief(result["data"])
+        body["prepend_report"] = build_nms_deterministic_brief(context_data)
+        body["forbid_uncomputed_cadence"] = True
         body["conversation_store_messages"] = [
             {
                 "role": "user",
                 "content": (
                     f"NMS 심층 분석 요청: customer={customer_name or '-'}, "
                     f"site_codes={site_codes or '-'}, hours={body.get('hours') or default_hours}, "
+                    f"snapshot_id={(evidence_snapshot or {}).get('id') or '-'}, "
                     f"question={str(body.get('question') or '').strip() or '-'}"
                 ),
             }
@@ -2378,11 +4195,54 @@ class Handler(BaseHTTPRequestHandler):
         body.setdefault("num_ctx", NMS_ANALYSIS_NUM_CTX)
         body.setdefault("num_predict", NMS_ANALYSIS_NUM_PREDICT)
         body.setdefault("timeout", NMS_ANALYSIS_TIMEOUT)
-        return self.handle_chat(body)
+        payload, status = self.run_chat_completion(body)
+        payload["evidence_snapshot"] = evidence_snapshot
+        if evidence_snapshot:
+            payload.setdefault("warnings", []).append(
+                f"NMS 원본 evidence를 118 Evidence Store snapshot_id={evidence_snapshot.get('id')}에 저장하고 LLM에는 축약본만 전달했습니다."
+            )
+        return self.json_response(payload, status)
 
     def handle_model_lifecycle(self, body: dict[str, Any], keep_alive: str | int) -> None:
         model = str(body.get("model") or DEFAULT_MODEL)
         warnings: list[str] = []
+        if is_sglang_model(model) or (SGLANG_ENABLED and not OLLAMA_ENABLED):
+            if not is_sglang_model(model):
+                fallback = DEFAULT_MODEL if is_sglang_model(DEFAULT_MODEL) else SGLANG_MODEL
+                warnings.append(f"Ollama가 비활성화되어 요청 모델 {model} 대신 SGLang 모델 {fallback}로 처리했습니다.")
+                model = fallback
+            if keep_alive == 0 or str(keep_alive) == "0":
+                stop_sglang_if_running(warnings)
+            else:
+                ensure_sglang_model(model, warnings)
+            status = sglang_status()
+            return self.json_response(
+                {
+                    "ok": status["reachable"] or (keep_alive == 0 or str(keep_alive) == "0"),
+                    "model": model,
+                    "keep_alive": keep_alive,
+                    "warnings": warnings,
+                    "sglang": status,
+                    "running": status.get("running"),
+                    "gpu": gpu_status(),
+                    "time": utc_now(),
+                },
+                HTTPStatus.OK if status["reachable"] or (keep_alive == 0 or str(keep_alive) == "0") else HTTPStatus.BAD_GATEWAY,
+            )
+        if not OLLAMA_ENABLED:
+            return self.json_response(
+                {
+                    "ok": False,
+                    "model": model,
+                    "keep_alive": keep_alive,
+                    "warnings": warnings,
+                    "error": "Ollama is disabled and requested model is not the configured SGLang model.",
+                    "sglang_model": SGLANG_MODEL if SGLANG_ENABLED else "",
+                    "gpu": gpu_status(),
+                    "time": utc_now(),
+                },
+                HTTPStatus.BAD_GATEWAY,
+            )
         if keep_alive != 0 and str(keep_alive) != "0":
             unload_running_models_except(model, warnings)
         result = ollama_request(
@@ -2414,13 +4274,31 @@ class Handler(BaseHTTPRequestHandler):
                 "auth_required": bool(API_TOKEN),
                 "default_model": DEFAULT_MODEL,
                 "fast_model": FAST_MODEL,
+                "public_models": PUBLIC_MODEL_IDS,
                 "model_fallback_enabled": MODEL_FALLBACK_ENABLED,
                 "model_running_switch_guard_enabled": MODEL_RUNNING_SWITCH_GUARD_ENABLED,
                 "model_auto_unload_before_switch_enabled": MODEL_AUTO_UNLOAD_BEFORE_SWITCH_ENABLED,
+                "default_num_ctx": LLM_OPS_DEFAULT_NUM_CTX,
+                "ollama_enabled": OLLAMA_ENABLED,
+                "ollama_cpu_only_models": sorted(OLLAMA_CPU_ONLY_MODELS),
+                "ollama_keep_sglang_models": sorted(OLLAMA_KEEP_SGLANG_MODELS),
+                "ollama_disable_think_models": sorted(OLLAMA_DISABLE_THINK_MODELS),
+                "sglang_available_models": SGLANG_AVAILABLE_MODELS,
+                "model_aliases": MODEL_ALIASES,
+                "sglang_auto_switch_enabled": SGLANG_AUTO_SWITCH_ENABLED,
+                "large_log": {
+                    "directory": str(LARGE_LOG_DIR),
+                    "max_file_bytes": LARGE_LOG_MAX_FILE_BYTES,
+                    "max_total_bytes": LARGE_LOG_MAX_TOTAL_BYTES,
+                    "chunk_chars": LARGE_LOG_CHUNK_CHARS,
+                    "max_chunks": LARGE_LOG_MAX_CHUNKS,
+                },
             },
+            "nms_context_cache": nms_context_cache_snapshot(),
             "nms_monitor": NMS_MONITOR.snapshot(),
             "nms_autopilot": NMS_AUTOPILOT.snapshot(),
             "ollama": ollama_status(),
+            "sglang": sglang_status(),
             "gpu": gpu_status(),
         }
 
@@ -2510,6 +4388,7 @@ INDEX_HTML = r"""<!doctype html>
     .stack { display: grid; gap: 14px; }
     .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
     label { color: var(--muted); font-size: 13px; display: block; margin-bottom: 6px; }
+    .muted { color: var(--muted); font-size: 12px; }
     input, select, textarea, button {
       width: 100%;
       border: 1px solid var(--line);
@@ -2554,6 +4433,21 @@ INDEX_HTML = r"""<!doctype html>
       border: 1px solid var(--line);
     }
     .metric b { font-size: 22px; letter-spacing: -0.04em; }
+    .ops-list { display: grid; gap: 8px; max-height: 360px; overflow: auto; padding-right: 2px; }
+    .ops-item {
+      display: grid;
+      gap: 8px;
+      padding: 11px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.045);
+    }
+    .ops-title { font-weight: 800; letter-spacing: -0.02em; }
+    .ops-meta, .ops-preview, .ops-empty { color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .ops-preview { color: #c7d7d4; }
+    .ops-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .ops-actions button { min-width: 0; padding: 8px 10px; font-size: 12px; }
+    .ops-section-title { color: var(--muted); font-size: 12px; font-weight: 800; margin-top: 2px; }
     .pill {
       display: inline-flex;
       align-items: center;
@@ -2645,9 +4539,11 @@ INDEX_HTML = r"""<!doctype html>
         <div class="grid2">
           <div>
             <label>업체</label>
+            <input id="nmsCustomerSearch" placeholder="업체명, 코드, 현장명으로 검색" oninput="renderNmsCustomers()" />
             <select id="nmsCustomer" onchange="selectNmsCustomer()">
               <option value="">업체 목록 불러오기 필요</option>
             </select>
+            <small id="nmsCustomerSearchStatus" class="muted">검색어 없이 전체 표시</small>
           </div>
           <div>
             <label>현장</label>
@@ -2662,6 +4558,28 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div id="nmsMonitorSummary" class="metric">
           <span>모니터링 상태</span><b>확인 전</b>
+        </div>
+      </div>
+      <div class="card stack">
+        <div class="row" style="justify-content:space-between">
+          <strong>운영 데이터 열람</strong>
+          <span id="opsDataPill" class="pill warn">대기</span>
+        </div>
+        <div id="opsDataSummary" class="metric">
+          <span>자동분석/저장 분석</span><b style="font-size:14px">확인 전</b>
+        </div>
+        <div class="row">
+          <button class="secondary" onclick="loadOperationsDashboard()">운영 데이터 새로고침</button>
+          <button class="secondary" onclick="toggleOpsAutoRefresh()">운영 데이터 자동갱신</button>
+          <button class="secondary" onclick="loadNmsContext()">선택 원천 데이터 보기</button>
+        </div>
+        <div class="ops-section-title">자동분석 이력</div>
+        <div id="opsAutopilotList" class="ops-list">
+          <div class="ops-empty">토큰 저장 후 자동분석 이력을 불러옵니다.</div>
+        </div>
+        <div class="ops-section-title">최근 저장 분석</div>
+        <div id="opsSavedList" class="ops-list">
+          <div class="ops-empty">저장된 분석 결과가 여기에 표시됩니다.</div>
         </div>
       </div>
       <div class="card stack">
@@ -2719,6 +4637,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="row">
           <button onclick="runSelectedAnalysis()">분석 실행</button>
+          <button class="secondary" onclick="analyzeLargeLog()">대용량 로그 분석</button>
           <button class="secondary" onclick="continueConversation()">이어 묻기</button>
           <button class="secondary" onclick="saveCurrentAnalysis()">결과 저장</button>
           <button class="secondary" onclick="buildCodexTaskDraft()">Codex 지시 초안</button>
@@ -2735,11 +4654,15 @@ INDEX_HTML = r"""<!doctype html>
     const maxAttachmentCount = 5;
     const maxAttachmentFileBytes = 5 * 1024 * 1024;
     const maxAttachmentTotalBytes = 12 * 1024 * 1024;
+    const maxLargeLogFileBytes = 64 * 1024 * 1024;
+    const maxLargeLogTotalBytes = 128 * 1024 * 1024;
     let nmsCustomers = [];
     let nmsMonitorTimer = null;
     let healthTimer = null;
     let conversations = [];
     let savedAnalyses = [];
+    let operationsDashboard = null;
+    let opsRefreshTimer = null;
     let currentConversationId = localStorage.getItem(conversationKey) || "";
     $("token").value = localStorage.getItem(tokenKey) || "";
 
@@ -2749,6 +4672,7 @@ INDEX_HTML = r"""<!doctype html>
       loadConversations();
       loadNmsCustomers();
       refreshNmsMonitor();
+      loadOperationsDashboard(true);
       loadSavedAnalyses(true);
     }
 
@@ -2762,6 +4686,20 @@ INDEX_HTML = r"""<!doctype html>
 
     function setResult(value) {
       $("result").textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      }[ch]));
+    }
+
+    function compactTime(value) {
+      return String(value || "").replace("T", " ").replace("Z", "").slice(0, 16) || "-";
     }
 
     function formatBytes(bytes) {
@@ -2811,20 +4749,22 @@ INDEX_HTML = r"""<!doctype html>
       return btoa(binary);
     }
 
-    async function collectAttachmentPayloads() {
+    async function collectAttachmentPayloads(mode = "normal") {
       const files = attachmentFiles();
       if (!files.length) return [];
+      const maxFileBytes = mode === "large-log" ? maxLargeLogFileBytes : maxAttachmentFileBytes;
+      const maxTotalBytes = mode === "large-log" ? maxLargeLogTotalBytes : maxAttachmentTotalBytes;
       if (files.length > maxAttachmentCount) {
         throw new Error(`첨부파일은 최대 ${maxAttachmentCount}개까지 가능합니다.`);
       }
       const totalBytes = files.reduce((sum, file) => sum + (file.size || 0), 0);
-      if (totalBytes > maxAttachmentTotalBytes) {
-        throw new Error(`첨부파일 전체 크기는 ${formatBytes(maxAttachmentTotalBytes)} 이하여야 합니다.`);
+      if (totalBytes > maxTotalBytes) {
+        throw new Error(`첨부파일 전체 크기는 ${formatBytes(maxTotalBytes)} 이하여야 합니다.`);
       }
       const payloads = [];
       for (const file of files) {
-        if ((file.size || 0) > maxAttachmentFileBytes) {
-          throw new Error(`${file.name} 파일이 너무 큽니다. 파일당 ${formatBytes(maxAttachmentFileBytes)} 이하만 가능합니다.`);
+        if ((file.size || 0) > maxFileBytes) {
+          throw new Error(`${file.name} 파일이 너무 큽니다. 파일당 ${formatBytes(maxFileBytes)} 이하만 가능합니다.`);
         }
         const buffer = await file.arrayBuffer();
         payloads.push({
@@ -3106,15 +5046,161 @@ INDEX_HTML = r"""<!doctype html>
       updateSavedAnalysisStatus("선택 저장 분석을 삭제했습니다.");
     }
 
+    function opsTargetLabel(item) {
+      const target = item?.target || {};
+      return [
+        target.customer_name || item.customer_name || "",
+        target.site_name || target.site_code || item.site_name || item.site_code || "",
+      ].filter(Boolean).join(" / ") || item.title || "대상 미확인";
+    }
+
+    function renderOperationsDashboard(data) {
+      const monitor = data.monitor || {};
+      const autopilot = data.autopilot || {};
+      const summary = monitor.summary || {};
+      const autoSummary = autopilot.summary || {};
+      const history = data.autopilot_history || [];
+      const saved = data.saved_analyses || [];
+      const store = data.conversation_store || {};
+      $("opsDataPill").className = monitor.ok ? "pill" : "pill warn";
+      $("opsDataPill").textContent = monitor.ok ? "열람 가능" : "NMS 확인 필요";
+      $("opsDataSummary").innerHTML = `
+        <span>생성 ${compactTime(data.generated_at)} · 자동 ${compactTime(autopilot.last_run_at)}</span>
+        <b style="font-size:14px">
+          고객 ${summary.customer_count || 0} · 이벤트 ${summary.recent_event_count || 0}
+          · 자동분석 ${history.length}건 · 저장 ${store.saved_analyses || saved.length || 0}건
+          · 후보 ${autoSummary.candidate_count || 0}
+        </b>
+      `;
+      $("opsAutopilotList").innerHTML = history.length ? history.map((item) => `
+        <div class="ops-item">
+          <div class="ops-title">${escapeHtml(opsTargetLabel(item))}</div>
+          <div class="ops-meta">
+            ${escapeHtml(compactTime(item.updated_at))} · 메시지 ${item.message_count || 0} · ${escapeHtml(item.id)}
+          </div>
+          <div class="ops-preview">${escapeHtml(item.latest_assistant_preview || item.latest_user || "최근 자동분석 내용 없음")}</div>
+          <div class="ops-actions">
+            <button class="secondary" onclick="openAutopilotConversation('${escapeHtml(item.id)}')">대화 열기</button>
+          </div>
+        </div>
+      `).join("") : '<div class="ops-empty">자동분석 대화 이력이 아직 없습니다.</div>';
+      $("opsSavedList").innerHTML = saved.length ? saved.slice(0, 8).map((item) => `
+        <div class="ops-item">
+          <div class="ops-title">${escapeHtml(item.title || "저장 분석")}</div>
+          <div class="ops-meta">
+            ${escapeHtml(item.customer_name || "고객사 미지정")} / ${escapeHtml(item.site_name || item.site_code || "전체 현장")}
+            · ${escapeHtml(compactTime(item.updated_at))}
+          </div>
+          <div class="ops-preview">${escapeHtml(item.content_preview || item.question || "미리보기 없음")}</div>
+          <div class="ops-actions">
+            <button class="secondary" onclick="loadSavedAnalysisById('${escapeHtml(item.id)}')">저장분석 열기</button>
+          </div>
+        </div>
+      `).join("") : '<div class="ops-empty">최근 저장 분석이 없습니다.</div>';
+    }
+
+    async function loadOperationsDashboard(silent = false) {
+      try {
+        const data = await api("/api/nms/operations", {headers: headers()});
+        operationsDashboard = data;
+        renderOperationsDashboard(data);
+        if (!silent) {
+          setResult({
+            status: "운영 데이터 열람 갱신 완료",
+            generated_at: data.generated_at,
+            monitor_summary: data.monitor?.summary || {},
+            autopilot_summary: data.autopilot?.summary || {},
+            saved_analyses: (data.saved_analyses || []).length,
+          });
+        }
+      } catch (err) {
+        $("opsDataPill").className = "pill bad";
+        $("opsDataPill").textContent = "열람 실패";
+        $("opsDataSummary").innerHTML = `<span>오류</span><b style="font-size:14px">${escapeHtml(String(err))}</b>`;
+        if (!silent) setResult(`운영 데이터를 불러오지 못했습니다.\n${String(err)}`);
+      }
+    }
+
+    function toggleOpsAutoRefresh() {
+      if (opsRefreshTimer) {
+        clearInterval(opsRefreshTimer);
+        opsRefreshTimer = null;
+        $("opsDataPill").textContent = "자동갱신 중지";
+        return;
+      }
+      loadOperationsDashboard(true);
+      opsRefreshTimer = setInterval(() => loadOperationsDashboard(true), 60000);
+      $("opsDataPill").textContent = "자동갱신 중";
+    }
+
+    async function openAutopilotConversation(conversationId) {
+      if (!conversationId) return;
+      const data = await api(`/api/conversations/${encodeURIComponent(conversationId)}?limit=80`, {headers: headers()});
+      const conversation = data.conversation || {};
+      currentConversationId = conversation.id || conversationId;
+      localStorage.setItem(conversationKey, currentConversationId);
+      const target = conversation.meta?.target || {};
+      if (target.customer_name) $("customer").value = target.customer_name;
+      if (target.customer_name) {
+        const customer = nmsCustomers.find((entry) => entry.customer_name === target.customer_name);
+        if (customer) {
+          $("nmsCustomer").value = customer.customer_name;
+          selectNmsCustomer();
+          if (target.site_code) {
+            $("nmsSite").value = target.site_code;
+            selectNmsSite();
+          }
+        }
+      }
+      $("savedAnalysisTitle").value ||= `${opsTargetLabel({target, title: conversation.title})} 자동분석`;
+      const messages = (conversation.messages || []).slice(-12).map((message) => {
+        const role = message.role === "assistant" ? "LLM 분석" : "요청/근거";
+        return `[${role} · ${compactTime(message.created_at)}]\n${message.content || ""}`;
+      }).join("\n\n---\n\n");
+      setResult(messages || "자동분석 대화 내용이 없습니다.");
+      await loadConversations();
+    }
+
+    async function loadSavedAnalysisById(analysisId) {
+      if (!analysisId) return;
+      const select = $("savedAnalysisSelect");
+      const exists = Array.from(select.options || []).some((opt) => String(opt.value) === String(analysisId));
+      if (exists) {
+        select.value = String(analysisId);
+        return loadSavedAnalysis();
+      }
+      const data = await api(`/api/saved-analyses/${encodeURIComponent(analysisId)}`, {headers: headers()});
+      const item = data.item || {};
+      if (item.customer_name) $("customer").value = item.customer_name;
+      if (item.analysis_kind && [...$("template").options].some((opt) => opt.value === item.analysis_kind)) {
+        $("template").value = item.analysis_kind;
+      }
+      $("savedAnalysisTitle").value = item.title || "";
+      $("question").value = item.question || $("question").value;
+      $("prompt").value = item.source_excerpt || $("prompt").value;
+      setResult(item.content || "저장 내용이 없습니다.");
+      updateSavedAnalysisStatus(`저장 분석 ${item.id || analysisId}번을 불러왔습니다.`);
+    }
+
     function renderHealthMetrics(health, runningModels = null) {
-      $("statusPill").className = health.ollama.reachable ? "pill" : "pill bad";
-      $("statusPill").textContent = health.ollama.reachable ? "Ollama 연결 정상" : "Ollama 연결 실패";
+      const sglang = health.sglang || {};
+      const runtime = sglang.runtime_config || {};
+      const reachable = Boolean(sglang.reachable || (health.ollama && health.ollama.reachable));
+      $("statusPill").className = reachable ? "pill" : "pill bad";
+      $("statusPill").textContent = sglang.reachable ? "SGLang 연결 정상" : (reachable ? "LLM 연결 정상" : "LLM 연결 실패");
       const gpu = (health.gpu.gpus || [])[0] || {};
-      const runningSource = Array.isArray(runningModels) ? runningModels : (health.ollama.running || []);
+      const runningSource = Array.isArray(runningModels) ? runningModels : (sglang.running || (health.ollama && health.ollama.running) || []);
       const running = runningSource.map(m => m.name).join(", ") || "없음";
+      const vramPercent = gpu.memory_used_percent ?? (
+        gpu.memory_total_mib ? Math.round(((gpu.memory_used_mib || 0) / gpu.memory_total_mib) * 1000) / 10 : 0
+      );
+      const targetPercent = runtime.target_vram_percent ?? (
+        runtime.mem_fraction_static ? Math.round(runtime.mem_fraction_static * 1000) / 10 : "-"
+      );
       $("metrics").innerHTML = `
         <div class="metric"><span>GPU</span><b>${gpu.name || "미확인"}</b></div>
-        <div class="metric"><span>VRAM</span><b>${gpu.memory_used_mib || 0} / ${gpu.memory_total_mib || 0} MiB</b></div>
+        <div class="metric"><span>VRAM</span><b>${gpu.memory_used_mib || 0} / ${gpu.memory_total_mib || 0} MiB (${vramPercent}%)</b></div>
+        <div class="metric"><span>SGLang 목표</span><b>${targetPercent}% · ctx ${runtime.context_length || health.app.default_num_ctx || "-"}</b></div>
         <div class="metric"><span>GPU 사용률</span><b>${gpu.utilization_gpu_percent ?? 0}%</b></div>
         <div class="metric"><span>온도</span><b>${gpu.temperature_c ?? "-"}℃</b></div>
         <div class="metric"><span>실행 모델</span><b style="font-size:14px">${running}</b></div>
@@ -3151,7 +5237,11 @@ INDEX_HTML = r"""<!doctype html>
         for (const m of models.models || []) {
           const opt = document.createElement("option");
           opt.value = m.name;
-          if (m.name === models.default_model) {
+          if ((models.precision_models || []).includes(m.name)) {
+            opt.textContent = `정밀 분석(Q4 RAM) · ${m.name}`;
+          } else if (m.provider === "sglang") {
+            opt.textContent = `SGLang · ${m.name}`;
+          } else if (m.name === models.default_model) {
             opt.textContent = `운영 기본 · ${m.name}`;
           } else if (m.name === models.fast_model) {
             opt.textContent = `빠른 응답 · ${m.name}`;
@@ -3175,6 +5265,7 @@ INDEX_HTML = r"""<!doctype html>
       await loadConversations();
       await refreshNmsMonitor();
       await loadNmsCustomers();
+      await loadOperationsDashboard(true);
       await loadSavedAnalyses(true);
     }
 
@@ -3207,15 +5298,40 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    function normalizeSearchText(value) {
+      return String(value || "").toLowerCase().replace(/\s+/g, "");
+    }
+
+    function nmsCustomerSearchText(customer) {
+      const siteText = (customer.sites || [])
+        .map((site) => `${site.site_name || ""} ${site.site_code || ""}`)
+        .join(" ");
+      return normalizeSearchText(`${customer.customer_name || ""} ${customer.customer_code || ""} ${siteText}`);
+    }
+
     function renderNmsCustomers() {
       const select = $("nmsCustomer");
+      const previousValue = select.value;
+      const keyword = normalizeSearchText($("nmsCustomerSearch")?.value || "");
+      const filtered = keyword
+        ? nmsCustomers.filter((customer) => nmsCustomerSearchText(customer).includes(keyword))
+        : nmsCustomers.slice();
       select.innerHTML = '<option value="">업체 선택</option>';
-      for (const customer of nmsCustomers) {
+      for (const customer of filtered) {
         const opt = document.createElement("option");
         opt.value = customer.customer_name;
         opt.textContent = `${customer.customer_name} (${customer.site_count || 0}현장 / ${customer.recent_event_count || 0}이벤트)`;
         opt.dataset.customerCode = customer.customer_code || "";
         select.appendChild(opt);
+      }
+      if (previousValue && filtered.some((customer) => customer.customer_name === previousValue)) {
+        select.value = previousValue;
+      }
+      const status = $("nmsCustomerSearchStatus");
+      if (status) {
+        status.textContent = keyword
+          ? `${filtered.length}/${nmsCustomers.length}개 업체 표시`
+          : `${nmsCustomers.length}개 업체 표시`;
       }
       selectNmsCustomer();
     }
@@ -3488,6 +5604,46 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    async function analyzeLargeLog() {
+      try {
+        const files = attachmentFiles();
+        if (!files.length) {
+          setResult("대용량 로그 분석에는 TXT/LOG/CSV 등 로그 파일 첨부가 필요합니다.");
+          return;
+        }
+        setResult(`대용량 로그를 저장하고 분할 분석 중... 선택 모델(${ $("model").value || "운영 기본 모델" })로 실행합니다.`);
+        const attachments = await collectAttachmentPayloads("large-log");
+        const data = await api("/api/large-log/analyze", {
+          method: "POST",
+          headers: headers(),
+          body: JSON.stringify(conversationPayload({
+            model: $("model").value,
+            customer: $("customer").value,
+            site_code: $("nmsSite").value,
+            question: $("question").value,
+            prompt: $("prompt").value,
+            attachments,
+            source: "large-log-analysis",
+          })),
+        });
+        applyConversationFromResponse(data);
+        const stored = data.stored || {};
+        const scan = data.scan || {};
+        const header = [
+          "[대용량 로그 처리]",
+          `- 저장 위치: ${stored.directory || "-"}`,
+          `- 파일: ${(stored.items || []).map((item) => `${item.name}(${formatBytes(item.size || 0)})`).join(", ") || "-"}`,
+          `- 전체 조각: ${data.chunk_count_total || 0} / 분석 조각: ${data.chunk_count_analyzed || 0}`,
+          `- 라인수: ${scan.line_count || 0} / 문자수: ${scan.chars || 0}`,
+        ].join("\n");
+        setResult(`${header}\n\n${renderResponseWithAttachmentWarnings(data)}`);
+        $("savedAnalysisTitle").value ||= $("question").value.trim() || `${$("customer").value.trim() || "고객"} 대용량 로그 분석`;
+        refresh();
+      } catch (err) {
+        setResult(String(err));
+      }
+    }
+
     async function preload() {
       setResult("모델 프리로드 중...");
       const data = await api("/api/preload", {
@@ -3526,6 +5682,7 @@ INDEX_HTML = r"""<!doctype html>
     loadConversations();
     refreshNmsMonitor();
     loadNmsCustomers();
+    loadOperationsDashboard(true);
     loadSavedAnalyses(true);
     renderAttachmentSummary();
   </script>
