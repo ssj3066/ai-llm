@@ -140,6 +140,11 @@ NMS_ANALYSIS_TIMEOUT = int(os.getenv("NMS_ANALYSIS_TIMEOUT_SECONDS", "900"))
 NMS_ANALYSIS_NUM_CTX = int(os.getenv("NMS_ANALYSIS_NUM_CTX", "16384"))
 NMS_ANALYSIS_NUM_PREDICT = int(os.getenv("NMS_ANALYSIS_NUM_PREDICT", "3072"))
 NMS_ANALYSIS_REPEAT_PENALTY = float(os.getenv("NMS_ANALYSIS_REPEAT_PENALTY", "1.08"))
+NMS_FAST_ANALYSIS_MODEL = os.getenv("NMS_FAST_ANALYSIS_MODEL", FAST_MODEL)
+NMS_DEEP_ANALYSIS_MODEL = os.getenv("NMS_DEEP_ANALYSIS_MODEL", DEFAULT_MODEL)
+NMS_FAST_ANALYSIS_NUM_CTX = int(os.getenv("NMS_FAST_ANALYSIS_NUM_CTX", "8192"))
+NMS_FAST_ANALYSIS_NUM_PREDICT = int(os.getenv("NMS_FAST_ANALYSIS_NUM_PREDICT", "900"))
+NMS_FAST_ANALYSIS_TIMEOUT = int(os.getenv("NMS_FAST_ANALYSIS_TIMEOUT_SECONDS", "240"))
 NMS_AUTOPILOT_ENABLED = os.getenv("NMS_AUTOPILOT_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 NMS_AUTOPILOT_INTERVAL = int(os.getenv("NMS_AUTOPILOT_INTERVAL_SECONDS", "600"))
 NMS_AUTOPILOT_TARGET_COOLDOWN = int(os.getenv("NMS_AUTOPILOT_TARGET_COOLDOWN_SECONDS", "1800"))
@@ -1519,7 +1524,12 @@ def create_nms_evidence_snapshot(
     full_text = clip_middle_text(json_dumps_compact(context), NMS_EVIDENCE_STORE_MAX_FULL_CHARS)
     digest = build_nms_evidence_digest(context)
     deterministic_brief = build_nms_deterministic_brief(context)
-    source_type = "network-evidence-pack" if is_network_evidence_pack(context) else "nms-context"
+    if is_field_analysis_evidence_pack(context):
+        source_type = "field-analysis-evidence"
+    elif is_network_evidence_pack(context):
+        source_type = "network-evidence-pack"
+    else:
+        source_type = "nms-context"
     evidence_version = str(context.get("evidence_pack_version") or context.get("version") or "")
     context_hash = hashlib.sha256(full_text.encode("utf-8", errors="ignore")).hexdigest()[:16]
     now = utc_now()
@@ -1624,6 +1634,10 @@ def is_network_evidence_pack(context: dict[str, Any]) -> bool:
     return str((context or {}).get("evidence_pack_version") or "").startswith("network-evidence-pack")
 
 
+def is_field_analysis_evidence_pack(context: dict[str, Any]) -> bool:
+    return str((context or {}).get("evidence_pack_version") or "").startswith("field-analysis-evidence")
+
+
 def limited_list(value: Any, limit: int) -> list[Any]:
     if not isinstance(value, list):
         return []
@@ -1685,8 +1699,36 @@ def compact_compressed_evidence(value: Any) -> dict[str, Any]:
     return compact
 
 
+def compact_event_classification(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    compact = {
+        "version": value.get("version"),
+        "summary": value.get("summary") or {},
+        "data_quality": value.get("data_quality") or {},
+        "active_categories": limited_list(value.get("active_categories"), 12),
+        "top_events": limited_list(value.get("top_events"), 25),
+        "llm_focus": limited_list(value.get("llm_focus"), 12),
+    }
+    event_types = value.get("event_types") if isinstance(value.get("event_types"), dict) else {}
+    compact["event_types"] = {
+        key: {
+            "label": item.get("label") if isinstance(item, dict) else "",
+            "category": item.get("category") if isinstance(item, dict) else "",
+            "count": item.get("count") if isinstance(item, dict) else 0,
+            "max_severity_rank": item.get("max_severity_rank") if isinstance(item, dict) else 0,
+            "representative_events": limited_list(item.get("representative_events"), 2) if isinstance(item, dict) else [],
+        }
+        for key, item in list(event_types.items())[:20]
+    }
+    return compact
+
+
 def compact_network_evidence_for_llm(context: dict[str, Any]) -> dict[str, Any]:
     analysis = context.get("deterministic_analysis") or {}
+    event_classification = compact_event_classification(
+        context.get("event_classification") or analysis.get("event_classification") or {}
+    )
     raw = context.get("raw_evidence") or {}
     logs = raw.get("logs") or {}
     traffic = raw.get("traffic") or {}
@@ -1696,6 +1738,7 @@ def compact_network_evidence_for_llm(context: dict[str, Any]) -> dict[str, Any]:
         "data_policy": analysis.get("data_policy") or context.get("source_policy") or {},
         "coverage": analysis.get("coverage") or context.get("data_coverage") or {},
         "top_signals": limited_list(analysis.get("top_signals"), 40),
+        "event_classification": event_classification,
         "protocol_analysis": analysis.get("protocol_analysis") or {},
         "timeline": limited_list(analysis.get("timeline"), 80),
         "gaps": limited_list(analysis.get("gaps"), 30),
@@ -1725,6 +1768,7 @@ def compact_network_evidence_for_llm(context: dict[str, Any]) -> dict[str, Any]:
         "matched": context.get("matched") or {},
         "source_policy": context.get("source_policy") or {},
         "data_coverage": context.get("data_coverage") or {},
+        "event_classification": event_classification,
         "compressed_evidence": compressed,
         "deterministic_analysis": compact_analysis,
         "raw_evidence_policy": context.get("raw_evidence_policy") or {
@@ -1744,7 +1788,62 @@ def compact_network_evidence_for_llm(context: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def compact_field_analysis_evidence_for_llm(context: dict[str, Any]) -> dict[str, Any]:
+    compressed = context.get("compressed_evidence") if isinstance(context.get("compressed_evidence"), dict) else {}
+    aggregates = compressed.get("aggregates") if isinstance(compressed.get("aggregates"), dict) else {}
+    samples = compressed.get("representative_samples") if isinstance(compressed.get("representative_samples"), dict) else {}
+    analysis = context.get("deterministic_analysis") if isinstance(context.get("deterministic_analysis"), dict) else {}
+    return {
+        "generated_at": context.get("generated_at"),
+        "evidence_pack_version": context.get("evidence_pack_version"),
+        "requested": context.get("requested") or {},
+        "matched": context.get("matched") or {},
+        "target": context.get("target") or {},
+        "source_policy": context.get("source_policy") or {},
+        "data_coverage": context.get("data_coverage") or {},
+        "deterministic_analysis": {
+            "data_policy": analysis.get("data_policy") or {},
+            "top_signals": limited_list(analysis.get("top_signals"), 30),
+            "gaps": limited_list(analysis.get("gaps"), 30),
+            "root_cause_hypotheses": limited_list(analysis.get("root_cause_hypotheses"), 10),
+            "required_next_checks": limited_list(analysis.get("required_next_checks"), 30),
+        },
+        "compressed_evidence": {
+            "source_totals": compressed.get("source_totals") or {},
+            "aggregates": {
+                "pulse_status_counts": limited_list(aggregates.get("pulse_status_counts"), 20),
+                "pulse_endpoint_counts": limited_list(aggregates.get("pulse_endpoint_counts"), 20),
+                "pulse_metric_summary": limited_list(aggregates.get("pulse_metric_summary"), 40),
+                "site_collectors": limited_list(aggregates.get("site_collectors"), 20),
+                "diagnostic_commands": limited_list(aggregates.get("diagnostic_commands"), 30),
+                "polling_latest": limited_list(aggregates.get("polling_latest"), 40),
+            },
+            "representative_samples": {
+                "pulse_observations": limited_list(samples.get("pulse_observations"), 35),
+                "test_sessions": limited_list(samples.get("test_sessions"), 20),
+                "syslog_events": limited_list(samples.get("syslog_events"), 30),
+                "snmp_traps": limited_list(samples.get("snmp_traps"), 20),
+            },
+        },
+        "raw_evidence_policy": context.get("raw_evidence_policy") or {
+            "role": "bounded_samples",
+            "note": "선택 현장 테스트 대상의 제한 샘플이다. 전체 판단은 source_totals와 deterministic_analysis를 우선한다.",
+        },
+        "codex_command_set": context.get("codex_command_set") or {},
+        "llm_payload_policy": {
+            "rule": "33번 NMS가 선택 대상의 원천 데이터를 압축했고, 118번 LLM은 확정 사실과 누락 데이터를 분리해 보고서로 정리한다.",
+            "do_not_do": [
+                "public_ip와 private_ip를 같은 의미로 섞지 않는다.",
+                "없는 PoE/포트/VLAN/LLDP/ARP 값을 상상하지 않는다.",
+                "수집되지 않은 diagnostic 결과를 정상 결과로 해석하지 않는다.",
+            ],
+        },
+    }
+
+
 def compact_nms_context_for_llm(context: dict[str, Any]) -> dict[str, Any]:
+    if is_field_analysis_evidence_pack(context):
+        return compact_field_analysis_evidence_for_llm(context)
     if is_network_evidence_pack(context):
         return compact_network_evidence_for_llm(context)
     raw_logs = context.get("logs") or {}
@@ -1936,7 +2035,7 @@ def conversation_history_for_model(conversation_id: str, limit: int = CONVERSATI
     return history
 
 
-def run_command(args: list[str], timeout: int = 8) -> dict[str, Any]:
+def run_command(args: list[str], timeout: int = 8, env: dict[str, str] | None = None) -> dict[str, Any]:
     try:
         proc = subprocess.run(
             args,
@@ -1944,6 +2043,7 @@ def run_command(args: list[str], timeout: int = 8) -> dict[str, Any]:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
         return {
             "ok": proc.returncode == 0,
@@ -1955,6 +2055,18 @@ def run_command(args: list[str], timeout: int = 8) -> dict[str, Any]:
         return {"ok": False, "returncode": None, "stdout": "", "stderr": f"{args[0]} not found"}
     except subprocess.TimeoutExpired:
         return {"ok": False, "returncode": None, "stdout": "", "stderr": "command timeout"}
+
+
+def nvidia_compat_env() -> dict[str, str] | None:
+    compat_dir = os.getenv("NVIDIA_COMPAT_LIB_DIR", "").strip()
+    if not compat_dir or not Path(compat_dir).is_dir():
+        return None
+    env = os.environ.copy()
+    current_paths = [part for part in env.get("LD_LIBRARY_PATH", "").split(":") if part]
+    if compat_dir not in current_paths:
+        current_paths.insert(0, compat_dir)
+    env["LD_LIBRARY_PATH"] = ":".join(current_paths)
+    return env
 
 
 def parse_gpu_csv(output: str) -> list[dict[str, Any]]:
@@ -1983,18 +2095,25 @@ def parse_gpu_csv(output: str) -> list[dict[str, Any]]:
 
 
 def gpu_status() -> dict[str, Any]:
-    cmd = run_command(
-        [
-            "nvidia-smi",
-            "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu",
-            "--format=csv,noheader",
-        ],
-        timeout=8,
-    )
+    args = [
+        "nvidia-smi",
+        "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu",
+        "--format=csv,noheader",
+    ]
+    cmd = run_command(args, timeout=8)
+    used_compat = False
+    if not cmd["ok"]:
+        compat_env = nvidia_compat_env()
+        if compat_env:
+            compat_cmd = run_command(args, timeout=8, env=compat_env)
+            if compat_cmd["ok"]:
+                cmd = compat_cmd
+                used_compat = True
     return {
         "available": cmd["ok"],
         "gpus": parse_gpu_csv(cmd["stdout"]) if cmd["ok"] else [],
         "error": None if cmd["ok"] else cmd["stderr"],
+        "compat_library_path": os.getenv("NVIDIA_COMPAT_LIB_DIR", "").strip() if used_compat else "",
     }
 
 
@@ -2509,6 +2628,54 @@ def build_analysis_prompt(body: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def build_nms_evidence_digest(context: dict[str, Any]) -> str:
+    if is_field_analysis_evidence_pack(context):
+        target = context.get("target") or {}
+        matched = context.get("matched") or {}
+        coverage = context.get("data_coverage") or {}
+        analysis = context.get("deterministic_analysis") or {}
+        compressed = context.get("compressed_evidence") or {}
+        source_totals = compressed.get("source_totals") or {}
+        signals = analysis.get("top_signals") or []
+        gaps = analysis.get("gaps") or []
+        lines = [
+            f"- 분석 기준: {context.get('evidence_pack_version') or 'field-analysis-evidence'}. 33번 NMS 원천 evidence pack 기준이다.",
+            (
+                "- 선택 대상: "
+                f"{target.get('target_name') or '-'} / type={target.get('target_type') or matched.get('target_type') or '-'} / "
+                f"model={target.get('model_name') or target.get('model') or '-'}"
+            ),
+            (
+                "- 위치/주소: "
+                f"customer={matched.get('customer_name') or '-'}, site={matched.get('site_name') or matched.get('site_code') or '-'}, "
+                f"public_ip={target.get('public_ip') or '-'}, private_ip={target.get('private_ip') or '-'}"
+            ),
+            (
+                "- 커버리지: "
+                f"pulse_obs={coverage.get('pulse_observation_count', 0)}, "
+                f"pulse_metrics={coverage.get('pulse_metric_sample_count', 0)}, "
+                f"syslog={coverage.get('syslog_sample_count', 0)}, "
+                f"trap={coverage.get('trap_sample_count', 0)}, "
+                f"diagnostics={coverage.get('diagnostic_sample_count', 0)}, "
+                f"last_age_min={coverage.get('latest_age_minutes')}"
+            ),
+            (
+                "- 원천 집계: "
+                f"pulse={((source_totals.get('pulse_observations') or {}).get('total') or 0)}, "
+                f"metrics={((source_totals.get('pulse_metrics') or {}).get('total') or 0)}, "
+                f"collector_diag={((source_totals.get('collector_diagnostics') or {}).get('sample_count') or 0)}"
+            ),
+            f"- 상위 신호: {len(signals)}건",
+        ]
+        for item in signals[:8]:
+            lines.append(
+                f"  · {item.get('severity')} / {item.get('source_type')} / {item.get('signal_type')} / "
+                f"{item.get('evidence') or '-'}"
+            )
+        if gaps:
+            lines.append("- 누락/주의 데이터:")
+            lines.extend([f"  · {item}" for item in gaps[:10]])
+        return "\n".join(lines)
+
     if is_network_evidence_pack(context):
         matched = context.get("matched") or {}
         coverage = context.get("data_coverage") or {}
@@ -2516,6 +2683,9 @@ def build_nms_evidence_digest(context: dict[str, Any]) -> str:
         compressed = context.get("compressed_evidence") or {}
         source_totals = compressed.get("source_totals") or {}
         aggregates = compressed.get("aggregates") or {}
+        event_classification = context.get("event_classification") or analysis.get("event_classification") or {}
+        event_summary = event_classification.get("summary") or {}
+        active_categories = event_classification.get("active_categories") or []
         top_signals = analysis.get("top_signals") or []
         hypotheses = analysis.get("root_cause_hypotheses") or []
         gaps = analysis.get("gaps") or []
@@ -2538,6 +2708,22 @@ def build_nms_evidence_digest(context: dict[str, Any]) -> str:
             ),
             f"- 상위 이상 신호: {len(top_signals)}건",
         ]
+        if event_summary:
+            lines.append(
+                "- 이벤트 분류: "
+                f"primary_category={event_summary.get('primary_category') or '-'}, "
+                f"primary_event={event_summary.get('primary_event_type') or '-'}, "
+                f"risk={event_summary.get('risk_level') or '-'}, "
+                f"signals={event_summary.get('total_signal_count', 0)}"
+            )
+        if active_categories:
+            lines.append("- 분류별 분석 레인:")
+            for item in active_categories[:8]:
+                lines.append(
+                    f"  · {item.get('label') or item.get('category')}: "
+                    f"{item.get('event_count', 0)}건 / max={item.get('max_severity') or '-'} / "
+                    f"types={item.get('event_types') or {}}"
+                )
         for item in top_signals[:8]:
             lines.append(
                 f"  · {item.get('severity')} / {item.get('source_type')} / {item.get('signal_type')} / "
@@ -2595,6 +2781,53 @@ def build_nms_evidence_digest(context: dict[str, Any]) -> str:
 
 
 def build_nms_deterministic_brief(context: dict[str, Any]) -> str:
+    if is_field_analysis_evidence_pack(context):
+        requested = context.get("requested") or {}
+        matched = context.get("matched") or {}
+        target = context.get("target") or {}
+        coverage = context.get("data_coverage") or {}
+        analysis = context.get("deterministic_analysis") or {}
+        compressed = context.get("compressed_evidence") or {}
+        source_totals = compressed.get("source_totals") or {}
+        signals = analysis.get("top_signals") or []
+        gaps = analysis.get("gaps") or []
+        next_checks = analysis.get("required_next_checks") or []
+        lines = [
+            "현장 테스트 대상 Evidence Pack",
+            (
+                f"- 대상: {target.get('target_name') or '-'} "
+                f"({target.get('model_name') or target.get('model') or '-'}) / type={requested.get('target_type') or matched.get('target_type') or '-'}"
+            ),
+            f"- 위치: {matched.get('customer_name') or '-'} / {matched.get('site_name') or matched.get('site_code') or '-'}",
+            f"- 주소 분리: public_ip={target.get('public_ip') or '-'} / private_ip={target.get('private_ip') or '-'}",
+            f"- 상태: {target.get('target_status') or '-'} / last_age_min={target.get('last_observed_age_minutes')}",
+            (
+                "- 커버리지: "
+                f"Pulse observation={coverage.get('pulse_observation_count', 0)}, "
+                f"Pulse metric={coverage.get('pulse_metric_sample_count', 0)}, "
+                f"Syslog={coverage.get('syslog_sample_count', 0)}, "
+                f"Trap={coverage.get('trap_sample_count', 0)}, "
+                f"Diagnostic={coverage.get('diagnostic_sample_count', 0)}"
+            ),
+            (
+                "- 기간 집계: "
+                f"pulse_total={((source_totals.get('pulse_observations') or {}).get('total') or 0)}, "
+                f"metric_total={((source_totals.get('pulse_metrics') or {}).get('total') or 0)}, "
+                f"collector_diag={((source_totals.get('collector_diagnostics') or {}).get('sample_count') or 0)}"
+            ),
+        ]
+        if signals:
+            lines.append("- 상위 신호:")
+            for item in signals[:10]:
+                lines.append(f"  · {item.get('severity')} / {item.get('source_type')} / {item.get('signal_type')} / {item.get('evidence') or '-'}")
+        if gaps:
+            lines.append("- 누락/주의 데이터:")
+            lines.extend([f"  · {item}" for item in gaps[:10]])
+        if next_checks:
+            lines.append("- 다음 확인 작업:")
+            lines.extend([f"  · {item}" for item in next_checks[:8]])
+        return "\n".join(lines)
+
     if is_network_evidence_pack(context):
         requested = context.get("requested") or {}
         matched = context.get("matched") or {}
@@ -2603,6 +2836,10 @@ def build_nms_deterministic_brief(context: dict[str, Any]) -> str:
         compressed = context.get("compressed_evidence") or {}
         source_totals = compressed.get("source_totals") or {}
         aggregates = compressed.get("aggregates") or {}
+        event_classification = context.get("event_classification") or analysis.get("event_classification") or {}
+        event_summary = event_classification.get("summary") or {}
+        active_categories = event_classification.get("active_categories") or []
+        llm_focus = event_classification.get("llm_focus") or []
         signals = analysis.get("top_signals") or []
         timeline = analysis.get("timeline") or []
         hypotheses = analysis.get("root_cause_hypotheses") or []
@@ -2631,6 +2868,26 @@ def build_nms_deterministic_brief(context: dict[str, Any]) -> str:
                 f"interface={((source_totals.get('interface_metric') or {}).get('total') or 0)}"
             ),
         ]
+        if event_summary:
+            lines.append(
+                "- 이벤트 분류 요약: "
+                f"primary_category={event_summary.get('primary_category') or '-'}, "
+                f"primary_event={event_summary.get('primary_event_type') or '-'}, "
+                f"risk={event_summary.get('risk_level') or '-'}, "
+                f"signals={event_summary.get('total_signal_count', 0)}"
+            )
+        if active_categories:
+            lines.append("- 분류별 이벤트:")
+            for item in active_categories[:8]:
+                lines.append(
+                    f"  · {item.get('label') or item.get('category')}: "
+                    f"{item.get('event_count', 0)}건 / max={item.get('max_severity') or '-'} / "
+                    f"types={item.get('event_types') or {}}"
+                )
+        if llm_focus:
+            lines.append("- 118 LLM 세분화 지시:")
+            for item in llm_focus[:8]:
+                lines.append(f"  · {item.get('label') or item.get('category')}: {item.get('instruction') or '-'}")
         if dhcp_summary.get("total_events"):
             lines.append(
                 "- DHCP 분석: "
@@ -2782,7 +3039,19 @@ def build_nms_analysis_prompt(
             "LLM 프롬프트에는 요약/축약 JSON만 포함되므로, 없는 원문 값을 상상하지 말고 "
             "필요하면 snapshot_id 기준으로 추가 조회가 필요하다고 표시한다."
         )
-    if is_network_evidence_pack(context):
+    if is_field_analysis_evidence_pack(context):
+        command_set = context.get("codex_command_set") or {}
+        system_prompt = (
+            "너는 Codex가 지휘하는 현장 네트워크 테스트 장비 분석 보고 담당자다. "
+            "NETSCOUT Pulse, Ubuntu Collector, 향후 고객사 현장 테스트 장비의 evidence pack만 근거로 판단한다. "
+            "public_ip는 중앙 서버가 본 고객사 공인 IP이고 private_ip 또는 pulse_reported_ip는 장비/collector가 보고한 내부 IP다. "
+            "두 주소를 같은 의미로 섞지 않는다. "
+            "PoE, 링크, 포트, VLAN, LLDP, ARP, MAC, diagnostic 결과가 없으면 unknown 또는 자료 없음으로 표시한다. "
+            "확정 사실/추정/반박 근거/누락 데이터/원격 확인/현장 확인/고객 보고 문안을 반드시 분리한다. "
+            "JSON에 없는 결과를 만들지 말고, timestamp와 count가 있는 항목만 수치 근거로 인용한다."
+        )
+        command_prompt = command_set.get("recommended_prompt") or ""
+    elif is_network_evidence_pack(context):
         command_set = context.get("codex_command_set") or {}
         system_prompt = (
             "너는 Codex가 지휘하는 고객사별 네트워크 장애 분석 보고 담당자다. "
@@ -2793,6 +3062,7 @@ def build_nms_analysis_prompt(
             "DHCP DISCOVER/OFFER 반복만으로 보안 위협이나 CRITICAL을 단정하지 않는다. "
             "반복 간격/주기는 JSON에 계산된 cadence/interval 값이 있을 때만 말하고, 없으면 정확한 타임스탬프 샘플만 인용한다. "
             "traffic.interfaces 또는 interface_metrics가 없으면 트래픽 정상/비정상을 단정하지 않는다. "
+            "event_classification이 있으면 llm_focus 지시를 우선 적용하고 네트워크 트래픽, 인터넷/WAN, 장비, 클라이언트, NAS 상태, NAS 파일변화, NAS collector를 별도 섹션으로 분리한다. "
             "JSON에 없는 내용은 단정하지 말고 '자료 없음'으로 표시한다."
         )
         command_prompt = command_set.get("recommended_prompt") or ""
@@ -2822,6 +3092,8 @@ def build_nms_analysis_prompt(
         "분석 지침:\n"
         "- NMS 요약을 그대로 결론으로 쓰지 말고 고객사별 evidence pack의 원천 근거와 규칙 판정을 먼저 검증한다.\n"
         "- 먼저 compressed_evidence.source_totals와 aggregates를 보고 기간 전체 경향을 잡은 뒤 raw_evidence_samples로 대표 로그를 검증한다.\n"
+        "- event_classification.summary, active_categories, top_events, llm_focus가 있으면 이것을 먼저 읽고 분류별 분석 순서를 정한다.\n"
+        "- 네트워크 트래픽, 인터넷/WAN, 네트워크 장비, 클라이언트/단말, NAS 상태, NAS 파일변화, NAS collector, 데이터 정합성을 한 문단에 섞지 않는다.\n"
         "- raw_evidence_samples의 샘플 건수를 전체 건수로 해석하지 않는다.\n"
         "- 이전 저장 분석은 참고용이다. 현재 로그/트래픽과 다른 부분이 있으면 차이를 먼저 설명한다.\n"
         "- 첨부자료가 있으면 현재 NMS 원천값과 모순되는지 먼저 비교하고, 첨부자료의 수치/표/문장을 근거에 함께 반영한다.\n"
@@ -2840,14 +3112,56 @@ def build_nms_analysis_prompt(
         "출력 형식:\n"
         "1. 종합 판정: 정상/주의/위험 중 하나와 신뢰도\n"
         "2. 핵심 근거: 시간, 장비명, 수치, 로그 문구를 포함해 5개 이상\n"
-        "3. 새벽 시간대 이벤트 분석: 집중 시간, 반복성, NAS 파일작업/랜섬웨어 의심 여부\n"
-        "4. NMS/Grafana 관측값 해석: 장비 상태, 트래픽, 프로브, Trap/Syslog를 분리\n"
-        "5. 의심 원인 우선순위: 가능성 높은 순서와 반박 근거\n"
-        "6. 즉시 원격 확인 작업: 명령 또는 화면 경로 중심\n"
-        "7. 현장 확인 필요 작업: 케이블/스위치/공유기/NAS/단말 기준\n"
-        "8. 추가로 수집해야 할 데이터"
+        "3. 이벤트 분류별 분석: 네트워크 트래픽/인터넷WAN/장비/클라이언트/NAS상태/NAS파일변화/NAS collector/데이터정합성을 분리\n"
+        "4. 새벽 시간대 이벤트 분석: 집중 시간, 반복성, NAS 파일작업/랜섬웨어 의심 여부\n"
+        "5. NMS/Grafana 관측값 해석: 장비 상태, 트래픽, 프로브, Trap/Syslog를 분리\n"
+        "6. 의심 원인 우선순위: 가능성 높은 순서와 반박 근거\n"
+        "7. 즉시 원격 확인 작업: 명령 또는 화면 경로 중심\n"
+        "8. 현장 확인 필요 작업: 케이블/스위치/공유기/NAS/단말 기준\n"
+        "9. 추가로 수집해야 할 데이터"
     )
     return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+
+
+def select_nms_analysis_profile(depth: str, context: dict[str, Any], explicit_model: Any = None) -> dict[str, Any]:
+    if str(explicit_model or "").strip():
+        return {
+            "name": "explicit",
+            "model": str(explicit_model).strip(),
+            "num_ctx": NMS_ANALYSIS_NUM_CTX,
+            "num_predict": NMS_ANALYSIS_NUM_PREDICT,
+            "timeout": NMS_ANALYSIS_TIMEOUT,
+            "reason": "request model was explicitly provided",
+        }
+
+    normalized_depth = str(depth or "").strip().lower()
+    analysis = context.get("deterministic_analysis") or {}
+    event_classification = context.get("event_classification") or analysis.get("event_classification") or {}
+    event_summary = event_classification.get("summary") or {}
+    total_signals = int(event_summary.get("total_signal_count") or len(analysis.get("top_signals") or []) or 0)
+    risk_level = str(event_summary.get("risk_level") or "").lower()
+    quick_depths = {"quick", "fast", "brief", "summary", "shallow", "간단", "요약", "빠른"}
+    deep_depths = {"deep", "detailed", "field", "report", "심층", "정밀", "현장", "보고서"}
+    low_signal = total_signals <= 2 and risk_level in {"", "ok", "info", "unknown"}
+
+    if normalized_depth in quick_depths or (normalized_depth not in deep_depths and low_signal):
+        return {
+            "name": "fast",
+            "model": NMS_FAST_ANALYSIS_MODEL,
+            "num_ctx": min(NMS_ANALYSIS_NUM_CTX, NMS_FAST_ANALYSIS_NUM_CTX),
+            "num_predict": min(NMS_ANALYSIS_NUM_PREDICT, NMS_FAST_ANALYSIS_NUM_PREDICT),
+            "timeout": min(NMS_ANALYSIS_TIMEOUT, NMS_FAST_ANALYSIS_TIMEOUT),
+            "reason": f"depth={depth or '-'}, signals={total_signals}, risk={risk_level or '-'}",
+        }
+
+    return {
+        "name": "deep",
+        "model": NMS_DEEP_ANALYSIS_MODEL,
+        "num_ctx": NMS_ANALYSIS_NUM_CTX,
+        "num_predict": NMS_ANALYSIS_NUM_PREDICT,
+        "timeout": NMS_ANALYSIS_TIMEOUT,
+        "reason": f"depth={depth or '-'}, signals={total_signals}, risk={risk_level or '-'}",
+    }
 
 
 def run_ollama_chat_messages(
@@ -3376,6 +3690,10 @@ class Handler(BaseHTTPRequestHandler):
                     "auth_required": bool(API_TOKEN),
                     "default_model": DEFAULT_MODEL,
                     "fast_model": FAST_MODEL,
+                    "nms_fast_analysis_model": NMS_FAST_ANALYSIS_MODEL,
+                    "nms_deep_analysis_model": NMS_DEEP_ANALYSIS_MODEL,
+                    "nms_fast_analysis_num_ctx": NMS_FAST_ANALYSIS_NUM_CTX,
+                    "nms_fast_analysis_num_predict": NMS_FAST_ANALYSIS_NUM_PREDICT,
                     "public_models": PUBLIC_MODEL_IDS,
                     "model_fallback_enabled": MODEL_FALLBACK_ENABLED,
                     "model_running_switch_guard_enabled": MODEL_RUNNING_SWITCH_GUARD_ENABLED,
@@ -3543,6 +3861,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_large_log_analyze(body)
         if route == "/api/nms/analyze":
             return self.handle_nms_analyze(body)
+        if route == "/api/nms/field-analyze":
+            return self.handle_nms_field_analyze(body)
         if route == "/api/nms/autopilot/run":
             return self.json_response(NMS_AUTOPILOT.run_once(force=bool(body.get("force", True))))
         if route == "/api/preload":
@@ -3762,6 +4082,30 @@ class Handler(BaseHTTPRequestHandler):
                     params,
                     timeout=max(NMS_CONTEXT_TIMEOUT, 30),
                 )
+            return self.json_response(result["data"], HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY)
+        if route == "/api/nms/field-targets":
+            result = nms_get(
+                "/api/integrations/erp/field-analysis-targets",
+                {
+                    "q": first("q"),
+                    "target_types": first("target_types"),
+                    "limit": first("limit", "100"),
+                },
+                timeout=max(NMS_CONTEXT_TIMEOUT, 20),
+            )
+            return self.json_response(result["data"], HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY)
+        if route == "/api/nms/field-evidence":
+            result = nms_get(
+                "/api/integrations/erp/field-analysis-evidence",
+                {
+                    "target_type": first("target_type"),
+                    "target_id": first("target_id"),
+                    "hours": first("hours", "24"),
+                    "limit": first("limit", "80"),
+                    "from": first("from"),
+                },
+                timeout=max(NMS_CONTEXT_TIMEOUT, 30),
+            )
             return self.json_response(result["data"], HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY)
         if route == "/api/nms/evidence-snapshots":
             items = list_nms_evidence_snapshots(
@@ -4188,18 +4532,128 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             }
         ]
-        body.setdefault("model", DEFAULT_MODEL)
+        analysis_profile = select_nms_analysis_profile(depth, context_data, body.get("model"))
+        body.setdefault("model", analysis_profile["model"])
         body.setdefault("temperature", 0.08)
         body.setdefault("top_p", 0.82)
         body.setdefault("repeat_penalty", NMS_ANALYSIS_REPEAT_PENALTY)
-        body.setdefault("num_ctx", NMS_ANALYSIS_NUM_CTX)
-        body.setdefault("num_predict", NMS_ANALYSIS_NUM_PREDICT)
-        body.setdefault("timeout", NMS_ANALYSIS_TIMEOUT)
+        body.setdefault("num_ctx", analysis_profile["num_ctx"])
+        body.setdefault("num_predict", analysis_profile["num_predict"])
+        body.setdefault("timeout", analysis_profile["timeout"])
         payload, status = self.run_chat_completion(body)
+        payload["nms_analysis_profile"] = analysis_profile
         payload["evidence_snapshot"] = evidence_snapshot
         if evidence_snapshot:
             payload.setdefault("warnings", []).append(
                 f"NMS 원본 evidence를 118 Evidence Store snapshot_id={evidence_snapshot.get('id')}에 저장하고 LLM에는 축약본만 전달했습니다."
+            )
+        return self.json_response(payload, status)
+
+    def handle_nms_field_analyze(self, body: dict[str, Any]) -> None:
+        target_type = str(body.get("target_type") or "").strip()
+        target_id = str(body.get("target_id") or "").strip()
+        if not target_type or not target_id:
+            return self.json_response({"error": "target_type and target_id are required"}, HTTPStatus.BAD_REQUEST)
+
+        depth = str(body.get("depth") or body.get("analysis_depth") or "field").strip().lower()
+        context_params = {
+            "target_type": target_type,
+            "target_id": target_id,
+            "hours": body.get("hours") or 24,
+            "limit": body.get("limit") or 80,
+            "from": body.get("from") or "",
+        }
+        result = nms_get(
+            "/api/integrations/erp/field-analysis-evidence",
+            context_params,
+            timeout=max(NMS_CONTEXT_TIMEOUT, 30),
+        )
+        if not result["ok"]:
+            return self.json_response(result_data(result) or {"error": result.get("data")}, HTTPStatus.BAD_GATEWAY)
+
+        context_data = result_data(result)
+        matched = safe_dict(context_data.get("matched"))
+        target = safe_dict(context_data.get("target"))
+        effective_customer_name = str(matched.get("customer_name") or target.get("customer_name") or "").strip()
+        effective_site_codes = ",".join(str(value) for value in (matched.get("site_codes") or []) if value)
+        if not effective_site_codes and matched.get("site_code"):
+            effective_site_codes = str(matched.get("site_code"))
+        default_question = (
+            "선택한 현장 테스트 장비/Collector의 최근 evidence를 기준으로 고객사 네트워크 장애 여부, "
+            "누락 데이터, 현장 확인 항목, 고객 보고 문안을 정리해줘."
+        )
+        question = str(body.get("question") or default_question).strip()
+        evidence_snapshot = create_nms_evidence_snapshot(
+            context_data,
+            customer_name=effective_customer_name,
+            site_codes=effective_site_codes,
+            question=question,
+            depth=depth,
+            hours=context_params.get("hours") or 24,
+        )
+        stored_evidence_context = build_nms_evidence_store_context(
+            effective_customer_name,
+            effective_site_codes,
+            limit=int(body.get("evidence_snapshot_limit") or NMS_EVIDENCE_STORE_RECENT_LIMIT),
+        )
+        attachment_context = self.prepare_attachment_context(body)
+        if attachment_context is None:
+            return
+        body["attachment_context"] = attachment_context
+        body["attachments_context"] = attachment_context.get("text") or ""
+        body["saved_analysis_context"] = build_saved_analysis_context(
+            effective_customer_name,
+            effective_site_codes,
+            limit=int(body.get("saved_analysis_limit") or SAVED_ANALYSIS_CONTEXT_LIMIT),
+        )
+        body["messages"] = build_nms_analysis_prompt(
+            context_data,
+            question,
+            depth,
+            str(body.get("saved_analysis_context") or ""),
+            str(body.get("attachments_context") or ""),
+            stored_evidence_context,
+            evidence_snapshot,
+        )
+        body["prepend_report"] = build_nms_deterministic_brief(context_data)
+        body["forbid_uncomputed_cadence"] = True
+        body["conversation_store_messages"] = [
+            {
+                "role": "user",
+                "content": (
+                    f"현장 테스트 대상 분석 요청: target_type={target_type}, target_id={target_id}, "
+                    f"target_name={target.get('target_name') or '-'}, hours={context_params.get('hours')}, "
+                    f"snapshot_id={(evidence_snapshot or {}).get('id') or '-'}, question={question}"
+                ),
+            }
+        ]
+        analysis_profile = select_nms_analysis_profile(depth, context_data, body.get("model"))
+        body.setdefault("model", analysis_profile["model"])
+        body.setdefault("temperature", 0.08)
+        body.setdefault("top_p", 0.82)
+        body.setdefault("repeat_penalty", NMS_ANALYSIS_REPEAT_PENALTY)
+        body.setdefault("num_ctx", analysis_profile["num_ctx"])
+        body.setdefault("num_predict", analysis_profile["num_predict"])
+        body.setdefault("timeout", analysis_profile["timeout"])
+        payload, status = self.run_chat_completion(body)
+        payload["nms_analysis_profile"] = analysis_profile
+        payload["evidence_snapshot"] = evidence_snapshot
+        site_names = matched.get("site_names") if isinstance(matched.get("site_names"), list) else []
+        payload["field_target"] = {
+            "target_type": target_type,
+            "target_id": target_id,
+            "target_name": target.get("target_name") or target.get("name"),
+            "model_name": target.get("model_name") or target.get("model"),
+            "customer_name": effective_customer_name,
+            "site_name": target.get("site_name") or matched.get("site_name") or (site_names[0] if site_names else ""),
+            "site_codes": effective_site_codes,
+            "target_status": target.get("target_status") or target.get("status"),
+            "public_ip": target.get("public_ip"),
+            "private_ip": target.get("private_ip"),
+        }
+        if evidence_snapshot:
+            payload.setdefault("warnings", []).append(
+                f"현장 테스트 대상 evidence를 118 Evidence Store snapshot_id={evidence_snapshot.get('id')}에 저장하고 LLM에는 축약본만 전달했습니다."
             )
         return self.json_response(payload, status)
 
@@ -4274,6 +4728,10 @@ class Handler(BaseHTTPRequestHandler):
                 "auth_required": bool(API_TOKEN),
                 "default_model": DEFAULT_MODEL,
                 "fast_model": FAST_MODEL,
+                "nms_fast_analysis_model": NMS_FAST_ANALYSIS_MODEL,
+                "nms_deep_analysis_model": NMS_DEEP_ANALYSIS_MODEL,
+                "nms_fast_analysis_num_ctx": NMS_FAST_ANALYSIS_NUM_CTX,
+                "nms_fast_analysis_num_predict": NMS_FAST_ANALYSIS_NUM_PREDICT,
                 "public_models": PUBLIC_MODEL_IDS,
                 "model_fallback_enabled": MODEL_FALLBACK_ENABLED,
                 "model_running_switch_guard_enabled": MODEL_RUNNING_SWITCH_GUARD_ENABLED,
@@ -4508,6 +4966,7 @@ INDEX_HTML = r"""<!doctype html>
             <label>분석 기능</label>
             <select id="template">
               <option value="nms_deep">업체 NMS 심층분석</option>
+              <option value="field_target_report">현장 테스트 장비 분석</option>
               <option value="nms_context">선택 데이터 보기</option>
               <option value="maintenance_report">유지보수 보고서</option>
               <option value="customer_history">고객사 이력 요약</option>
@@ -4560,6 +5019,25 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div id="nmsMonitorSummary" class="metric">
           <span>모니터링 상태</span><b>확인 전</b>
+        </div>
+      </div>
+      <div class="card stack">
+        <div class="row" style="justify-content:space-between">
+          <strong>현장 테스트 분석 대상</strong>
+          <span id="fieldTargetPill" class="pill warn">대기</span>
+        </div>
+        <div>
+          <label>대상 검색</label>
+          <input id="fieldTargetSearch" placeholder="NETSCOUT, Collector, 고객사, 현장명" oninput="renderFieldTargets()" />
+          <select id="fieldTargetSelect" onchange="selectFieldTarget()">
+            <option value="">대상 목록 불러오기 필요</option>
+          </select>
+          <small id="fieldTargetStatus" class="muted">NETSCOUT Pulse와 Ubuntu Collector를 별도 분석 대상으로 선택합니다.</small>
+        </div>
+        <div class="row">
+          <button class="secondary" onclick="loadFieldTargets()">대상 새로고침</button>
+          <button class="secondary" onclick="loadFieldEvidence()">선택 근거 보기</button>
+          <button onclick="analyzeFieldTarget()">선택 대상 보고서</button>
         </div>
       </div>
       <div class="card stack">
@@ -4659,6 +5137,7 @@ INDEX_HTML = r"""<!doctype html>
     const maxLargeLogFileBytes = 64 * 1024 * 1024;
     const maxLargeLogTotalBytes = 128 * 1024 * 1024;
     let nmsCustomers = [];
+    let fieldTargets = [];
     let nmsMonitorTimer = null;
     let healthTimer = null;
     let conversations = [];
@@ -5270,6 +5749,7 @@ INDEX_HTML = r"""<!doctype html>
       await loadConversations();
       await refreshNmsMonitor();
       await loadNmsCustomers();
+      await loadFieldTargets(true);
       await loadOperationsDashboard(true);
       await loadSavedAnalyses(true);
     }
@@ -5298,13 +5778,183 @@ INDEX_HTML = r"""<!doctype html>
         }
       } catch (err) {
         $("nmsMonitorPill").className = "pill bad";
-        $("nmsMonitorPill").textContent = "NMS 인증/연결 실패";
-        $("nmsMonitorSummary").innerHTML = `<span>오류</span><b style="font-size:14px">${String(err)}</b>`;
+        const message = String(err);
+        const tokenMissing = !$("token").value.trim();
+        $("nmsMonitorPill").textContent = /unauthorized/i.test(message)
+          ? (tokenMissing ? "118 API 토큰 필요" : "118 API 토큰 확인 필요")
+          : "33 NMS 연결 확인 필요";
+        $("nmsMonitorSummary").innerHTML = `<span>오류</span><b style="font-size:14px">${escapeHtml(message)}</b>`;
       }
     }
 
     function normalizeSearchText(value) {
       return String(value || "").toLowerCase().replace(/\s+/g, "");
+    }
+
+    function fieldTargetTypeLabel(type) {
+      if (type === "netscout_pulse_device") return "NETSCOUT Pulse";
+      if (type === "ubuntu_collector") return "Ubuntu Collector";
+      return type || "대상";
+    }
+
+    function fieldTargetSearchText(target) {
+      return normalizeSearchText([
+        target.target_type,
+        target.target_name,
+        target.model_name,
+        target.customer_name,
+        target.site_name,
+        target.hostname,
+        target.target_status,
+      ].filter(Boolean).join(" "));
+    }
+
+    function fieldTargetOptionText(target) {
+      const typeLabel = fieldTargetTypeLabel(target.target_type);
+      const location = [target.customer_name, target.site_name || target.site_code].filter(Boolean).join(" / ") || "위치 미지정";
+      const model = target.model_name || target.model || "-";
+      const status = target.target_status || "unknown";
+      const age = target.last_observed_age_minutes === null || target.last_observed_age_minutes === undefined
+        ? ""
+        : ` · ${target.last_observed_age_minutes}분 전`;
+      return `${typeLabel} · ${target.target_name || "-"} · ${model} · ${location} · ${status}${age}`;
+    }
+
+    function renderFieldTargets() {
+      const select = $("fieldTargetSelect");
+      if (!select) return;
+      const previous = select.value;
+      const keyword = normalizeSearchText($("fieldTargetSearch")?.value || "");
+      const filtered = keyword ? fieldTargets.filter((target) => fieldTargetSearchText(target).includes(keyword)) : fieldTargets.slice();
+      select.innerHTML = '<option value="">현장 테스트 대상 선택</option>';
+      for (const target of filtered) {
+        const opt = document.createElement("option");
+        opt.value = `${target.target_type}:${target.target_id}`;
+        opt.textContent = fieldTargetOptionText(target);
+        select.appendChild(opt);
+      }
+      if (previous && filtered.some((target) => `${target.target_type}:${target.target_id}` === previous)) {
+        select.value = previous;
+      }
+      const status = $("fieldTargetStatus");
+      if (status) {
+        status.textContent = keyword
+          ? `${filtered.length}/${fieldTargets.length}개 대상 표시`
+          : `${fieldTargets.length}개 대상 표시`;
+      }
+    }
+
+    function selectedFieldTarget() {
+      const value = $("fieldTargetSelect")?.value || "";
+      if (!value) return null;
+      return fieldTargets.find((target) => `${target.target_type}:${target.target_id}` === value) || null;
+    }
+
+    function selectFieldTarget() {
+      const target = selectedFieldTarget();
+      if (!target) return;
+      $("template").value = "field_target_report";
+      if (target.customer_name) $("customer").value = target.customer_name;
+      $("question").value ||= "선택한 현장 테스트 장비/Collector의 최근 관측값을 보고서로 정리해줘.";
+      $("fieldTargetPill").className = target.target_status === "active" ? "pill" : "pill warn";
+      $("fieldTargetPill").textContent = `${fieldTargetTypeLabel(target.target_type)} 선택`;
+      loadSavedAnalyses(true);
+    }
+
+    async function loadFieldTargets(silent = false) {
+      try {
+        const query = new URLSearchParams({
+          q: $("fieldTargetSearch")?.value || "",
+          limit: "200",
+        });
+        const data = await api(`/api/nms/field-targets?${query.toString()}`, {headers: headers()});
+        fieldTargets = data.targets || [];
+        renderFieldTargets();
+        $("fieldTargetPill").className = "pill";
+        $("fieldTargetPill").textContent = `${fieldTargets.length}개 대상`;
+        if (!silent) {
+          setResult({
+            status: "현장 테스트 분석 대상 목록 갱신 완료",
+            count: fieldTargets.length,
+            targets: fieldTargets.slice(0, 12).map((target) => ({
+              type: target.target_type,
+              name: target.target_name,
+              model: target.model_name,
+              customer: target.customer_name,
+              site: target.site_name,
+              status: target.target_status,
+              last_observed_at: target.last_observed_at,
+              public_ip: target.public_ip,
+              private_ip: target.private_ip,
+            })),
+          });
+        }
+      } catch (err) {
+        $("fieldTargetPill").className = "pill bad";
+        $("fieldTargetPill").textContent = "대상 실패";
+        if (!silent) setResult(`현장 테스트 분석 대상 목록을 불러오지 못했습니다.\n${String(err)}`);
+      }
+    }
+
+    async function loadFieldEvidence() {
+      const target = selectedFieldTarget();
+      if (!target) {
+        setResult("현장 테스트 분석 대상을 먼저 선택하세요.");
+        return;
+      }
+      try {
+        const query = new URLSearchParams({
+          target_type: target.target_type,
+          target_id: target.target_id,
+          hours: "24",
+          limit: "80",
+        });
+        const data = await api(`/api/nms/field-evidence?${query.toString()}`, {headers: headers()});
+        $("template").value = "field_target_report";
+        $("customer").value = data.matched?.customer_name || target.customer_name || $("customer").value;
+        $("prompt").value = JSON.stringify(data, null, 2);
+        setResult({
+          target: data.target,
+          data_coverage: data.data_coverage,
+          gaps: data.deterministic_analysis?.gaps || [],
+          top_signals: data.deterministic_analysis?.top_signals || [],
+        });
+      } catch (err) {
+        setResult(String(err));
+      }
+    }
+
+    async function analyzeFieldTarget() {
+      const target = selectedFieldTarget();
+      if (!target) {
+        setResult("현장 테스트 분석 대상을 먼저 선택하세요.");
+        return;
+      }
+      try {
+        setResult(`현장 테스트 대상 분석 중... ${fieldTargetTypeLabel(target.target_type)} / ${target.target_name || target.target_id}`);
+        const attachments = await collectAttachmentPayloads();
+        const data = await api("/api/nms/field-analyze", {
+          method: "POST",
+          headers: headers(),
+          body: JSON.stringify(conversationPayload({
+            model: $("model").value,
+            target_type: target.target_type,
+            target_id: target.target_id,
+            question: $("question").value,
+            hours: 24,
+            limit: 80,
+            depth: "field",
+            attachments,
+            source: "nms-field-analysis",
+          })),
+        });
+        applyConversationFromResponse(data);
+        setResult(renderResponseWithAttachmentWarnings(data));
+        $("savedAnalysisTitle").value ||= `${target.target_name || "현장 테스트 대상"} 분석 보고서`;
+        refresh();
+      } catch (err) {
+        setResult(String(err));
+      }
     }
 
     function nmsCustomerSearchText(customer) {
@@ -5572,6 +6222,7 @@ INDEX_HTML = r"""<!doctype html>
     async function runSelectedAnalysis() {
       const mode = $("template").value;
       if (mode === "nms_deep") return analyzeNms();
+      if (mode === "field_target_report") return analyzeFieldTarget();
       if (mode === "nms_context") return loadNmsContext();
       if (mode === "codex_task") return buildCodexTaskDraft();
       return analyze();

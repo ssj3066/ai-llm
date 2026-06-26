@@ -12,6 +12,9 @@
 - 저장 분석 목록/불러오기/삭제: `GET|POST|DELETE /api/saved-analyses`
 - 33번 NMS 업체/현장 목록: `GET /api/nms/customers`
 - 33번 NMS 최근 컨텍스트: `GET /api/nms/context`
+- 33번 NMS 현장 테스트 분석 대상: `GET /api/nms/field-targets`
+- 33번 NMS 현장 테스트 대상 evidence: `GET /api/nms/field-evidence`
+- NETSCOUT Pulse/Ubuntu Collector 독립 분석: `POST /api/nms/field-analyze`
 - 33번 NMS 상시 모니터링 상태: `GET /api/nms/monitor/status`
 - 33번 NMS 선택 고객 분석: `POST /api/nms/analyze`
 - 33번 NMS 자동분석 워커 상태: `GET /api/nms/autopilot/status`
@@ -70,6 +73,8 @@ curl -sS -H "X-LLM-Ops-Token: $TOKEN" \
 - 수동 `POST /api/nms/analyze`는 긴 심층분석, Autopilot은 짧고 반복적인 상시 분석입니다. 자동분석의 출력 길이는 `NMS_AUTOPILOT_NUM_PREDICT`로 제한합니다.
 - 33번 NMS가 제공하는 `temporal.nas_ransomware_findings`는 규칙 기반 1차 경보로 취급하고, LLM 분석에서 severity/title/count/sample message를 우선 근거로 인용합니다.
 - 33번 NMS가 `network-evidence-pack` API를 제공하면 NMS 심층분석은 기존 `nms-context` 대신 이 고객사별 evidence pack을 우선 사용합니다. 33번은 기간 전체 원천 데이터를 `compressed_evidence`로 먼저 집계하고, 118번은 이 집계와 대표 샘플을 LLM 입력으로 압축해 사용합니다.
+- 휴대용 NETSCOUT Pulse와 현장 Ubuntu Collector는 `현장 테스트 분석 대상`에서 별도 선택합니다. 118번은 `field-analysis-evidence`를 받아 공인 접속 IP, 장비/collector 내부 보고 IP, PoE/포트/VLAN, syslog/trap, diagnostic 결과, 누락 데이터를 분리해 보고서를 생성합니다.
+- 향후 고객사에 설치할 Ubuntu Collector는 33번 NMS의 `collectors`에 등록하고 heartbeat가 들어오면 같은 목록에 표시됩니다. Collector 분석에서는 heartbeat, diagnostic command, syslog/trap, polling sample을 evidence로 사용합니다.
 - 과도한 원문 프롬프트가 들어오면 Ollama가 내부에서 임의 절단하기 전에 118번이 `LLM_OPS_MAX_PROMPT_CHARS`, `LLM_OPS_MAX_SINGLE_MESSAGE_CHARS`, `NMS_LLM_EVIDENCE_CHAR_LIMIT` 기준으로 명시적으로 압축하고 경고를 반환합니다.
 - 웹 콘솔의 `업체/현장 분석 보관함`은 고객사/현장별 분석 결과를 별도 저장하고, 같은 범위로 다시 분석할 때 저장 이력을 자동 참고 문맥으로 넣습니다.
 - 저장 분석은 `conversations.sqlite3` 내부 `saved_analyses` 테이블에 들어가며, 현재 UI에서는 저장/불러오기/삭제만 제공하고 수정은 새 저장으로 남깁니다.
